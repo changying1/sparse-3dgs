@@ -7,7 +7,7 @@
 ·
 <a href=""><strong>Deukhee Lee</strong></a>
 ·
-<a href=""><strong>Dosik Hwnag</strong></a>
+<a href=""><strong>Dosik Hwang</strong></a>
 </p>
 <h3 align="center">CVPR 2026</h3>
 
@@ -18,6 +18,9 @@
   <a href="https://www.youtube.com/watch?v=j7Lb6k3dXCE&t=66s"><img src="https://img.shields.io/badge/Video-YouTube-FF0000?style=flat&logo=youtube&logoColor=white" alt="Video"></a>
 </p>
 
+Official code implementation of
+**TWINGS: Thin Plate Splines Warp-aligned Initialization for Sparse-View Gaussian Splatting**
+accepted at CVPR 2026.
 
 <figure align="center">
   <img src="figures/fig2.jpg" width="100%">
