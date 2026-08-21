@@ -53,6 +53,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+    gaussians.ensure_visibility_history(len(scene.getTrainCameras()))
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -110,6 +111,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        gaussians.update_visibility(vind, radii > 0)
 
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
@@ -189,6 +191,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
+    print_visibility_statistics(gaussians)
+
 def prepare_output_and_logger(args):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
@@ -210,6 +214,23 @@ def prepare_output_and_logger(args):
     else:
         print("Tensorboard not available: not logging progress")
     return tb_writer
+
+def print_visibility_statistics(gaussians):
+    visible_view_count = gaussians.visible_view_count
+    if visible_view_count is None or visible_view_count.numel() == 0:
+        print("\nVisible statistics: unavailable")
+        return
+
+    counts = visible_view_count.float()
+    print("\nGaussian number:")
+    print(gaussians.get_xyz.shape[0])
+    print("\nVisible statistics:")
+    print("mean visible views:")
+    print(counts.mean().item())
+    print("max visible views:")
+    print(visible_view_count.max().item())
+    print("min visible views:")
+    print(visible_view_count.min().item())
 
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
     if tb_writer:

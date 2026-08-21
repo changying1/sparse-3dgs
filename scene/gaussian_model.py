@@ -60,6 +60,14 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
+        self.visibility_history = None
+        self.visible_view_count = None
+        self.birth_iteration = None
+        self.source_type = None
+        self.parent_index = None
+        self.completion_support_count = None
+        self.completion_age = None
+        self.is_completion = None
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
@@ -79,9 +87,20 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self._capture_structural_state(),
         )
     
     def restore(self, model_args, training_args):
+        if isinstance(model_args, dict):
+            official_state = model_args["official_state"]
+            structural_state = model_args.get("structural_state", None)
+        elif len(model_args) == 13:
+            official_state = model_args[:12]
+            structural_state = model_args[12]
+        else:
+            official_state = model_args
+            structural_state = None
+
         (self.active_sh_degree, 
         self._xyz, 
         self._features_dc, 
@@ -93,11 +112,132 @@ class GaussianModel:
         xyz_gradient_accum, 
         denom,
         opt_dict, 
-        self.spatial_lr_scale) = model_args
+        self.spatial_lr_scale) = official_state
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
+        self._restore_structural_state(structural_state)
+
+    def _structural_state_names(self):
+        return (
+            "visibility_history",
+            "visible_view_count",
+            "birth_iteration",
+            "source_type",
+            "parent_index",
+            "completion_support_count",
+            "completion_age",
+            "is_completion",
+        )
+
+    def _capture_structural_state(self):
+        return {name: getattr(self, name) for name in self._structural_state_names()}
+
+    def _restore_structural_state(self, structural_state):
+        if structural_state is None:
+            self.visibility_history = None
+            self._initialize_structural_state(self.get_xyz.shape[0], device=self.get_xyz.device, num_views=None)
+            return
+
+        for name in self._structural_state_names():
+            setattr(self, name, structural_state.get(name, None))
+        self._ensure_structural_state_count(self.get_xyz.shape[0], device=self.get_xyz.device)
+
+    def _initialize_structural_state(self, count, device=None, num_views=None):
+        if device is None:
+            device = self.get_xyz.device
+        if num_views is None:
+            self.visibility_history = None
+        else:
+            self.visibility_history = torch.zeros((count, num_views), dtype=torch.bool, device=device)
+        self.visible_view_count = torch.zeros((count), dtype=torch.long, device=device)
+        self.birth_iteration = torch.zeros((count), dtype=torch.long, device=device)
+        self.source_type = torch.zeros((count), dtype=torch.long, device=device)
+        self.parent_index = torch.full((count,), -1, dtype=torch.long, device=device)
+        self.completion_support_count = torch.zeros((count), dtype=torch.long, device=device)
+        self.completion_age = torch.zeros((count), dtype=torch.long, device=device)
+        self.is_completion = torch.zeros((count), dtype=torch.bool, device=device)
+
+    def _ensure_structural_state_count(self, count, device=None):
+        if device is None:
+            device = self.get_xyz.device
+        if self.visible_view_count is None:
+            self.visible_view_count = torch.zeros((count), dtype=torch.long, device=device)
+        if self.birth_iteration is None:
+            self.birth_iteration = torch.zeros((count), dtype=torch.long, device=device)
+        if self.source_type is None:
+            self.source_type = torch.zeros((count), dtype=torch.long, device=device)
+        if self.parent_index is None:
+            self.parent_index = torch.full((count,), -1, dtype=torch.long, device=device)
+        if self.completion_support_count is None:
+            self.completion_support_count = torch.zeros((count), dtype=torch.long, device=device)
+        if self.completion_age is None:
+            self.completion_age = torch.zeros((count), dtype=torch.long, device=device)
+        if self.is_completion is None:
+            self.is_completion = torch.zeros((count), dtype=torch.bool, device=device)
+
+    def _prune_structural_state(self, valid_points_mask):
+        for name in self._structural_state_names():
+            state = getattr(self, name)
+            if state is not None:
+                setattr(self, name, state[valid_points_mask])
+
+    def _append_structural_state(self, selected_pts_mask, source_type, repeat_count=1):
+        self._ensure_structural_state_count(selected_pts_mask.shape[0], device=selected_pts_mask.device)
+        parent_indices = torch.nonzero(selected_pts_mask, as_tuple=False).squeeze(1)
+        if repeat_count != 1:
+            parent_indices = parent_indices.repeat(repeat_count)
+        new_count = parent_indices.shape[0]
+
+        if self.visibility_history is not None:
+            new_visibility_history = self.visibility_history[selected_pts_mask]
+            if repeat_count != 1:
+                new_visibility_history = new_visibility_history.repeat(repeat_count, 1)
+            self.visibility_history = torch.cat((self.visibility_history, new_visibility_history), dim=0)
+
+        if self.visible_view_count is not None:
+            new_visible_view_count = self.visible_view_count[selected_pts_mask]
+            if repeat_count != 1:
+                new_visible_view_count = new_visible_view_count.repeat(repeat_count)
+            self.visible_view_count = torch.cat((self.visible_view_count, new_visible_view_count), dim=0)
+
+        device = self.get_xyz.device
+        self.birth_iteration = torch.cat((self.birth_iteration, torch.zeros((new_count), dtype=torch.long, device=device)), dim=0)
+        self.source_type = torch.cat((self.source_type, torch.full((new_count,), source_type, dtype=torch.long, device=device)), dim=0)
+        self.parent_index = torch.cat((self.parent_index, parent_indices.to(device=device, dtype=torch.long)), dim=0)
+        self.completion_support_count = torch.cat((self.completion_support_count, torch.zeros((new_count), dtype=torch.long, device=device)), dim=0)
+        self.completion_age = torch.cat((self.completion_age, torch.zeros((new_count), dtype=torch.long, device=device)), dim=0)
+        self.is_completion = torch.cat((self.is_completion, torch.zeros((new_count), dtype=torch.bool, device=device)), dim=0)
+
+    def ensure_visibility_history(self, num_views):
+        count = self.get_xyz.shape[0]
+        device = self.get_xyz.device
+        self._ensure_structural_state_count(count, device=device)
+        if self.visibility_history is None:
+            self.visibility_history = torch.zeros((count, num_views), dtype=torch.bool, device=device)
+            self.visible_view_count = torch.zeros((count), dtype=torch.long, device=device)
+            return
+        if self.visibility_history.shape[0] != count:
+            raise ValueError("visibility_history first dimension must match the current Gaussian count.")
+        if self.visibility_history.shape[1] != num_views:
+            raise ValueError("visibility_history second dimension must match the training view count.")
+        if self.visible_view_count is None or self.visible_view_count.shape[0] != count:
+            self.visible_view_count = self.visibility_history.sum(dim=1).to(dtype=torch.long)
+
+    def update_visibility(self, view_id, visible_mask):
+        visible_mask = visible_mask.to(device=self.get_xyz.device, dtype=torch.bool).reshape(-1)
+        if visible_mask.shape[0] != self.get_xyz.shape[0]:
+            raise ValueError("visible_mask first dimension must match the current Gaussian count.")
+        if self.visibility_history is None:
+            self.ensure_visibility_history(view_id + 1)
+        if view_id < 0 or view_id >= self.visibility_history.shape[1]:
+            raise ValueError("view_id must be within the visibility_history view dimension.")
+
+        previous_visible = self.visibility_history[:, view_id]
+        newly_visible = torch.logical_and(visible_mask, torch.logical_not(previous_visible))
+        self.visibility_history[:, view_id] = torch.logical_or(previous_visible, visible_mask)
+        self.visible_view_count += newly_visible.to(dtype=self.visible_view_count.dtype)
 
     @property
     def get_scaling(self):
@@ -174,6 +314,7 @@ class GaussianModel:
         self.pretrained_exposures = None
         exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
+        self._initialize_structural_state(self.get_xyz.shape[0], device=self.get_xyz.device, num_views=len(cam_infos))
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -362,6 +503,7 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.tmp_radii = self.tmp_radii[valid_points_mask]
+        self._prune_structural_state(valid_points_mask)
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -406,15 +548,30 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
-        n_init_points = self.get_xyz.shape[0]
-        # Extract points that satisfy the gradient condition
-        padded_grad = torch.zeros((n_init_points), device="cuda")
-        padded_grad[:grads.shape[0]] = grads.squeeze()
-        selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
-        selected_pts_mask = torch.logical_and(selected_pts_mask,
-                                              torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+    def _validate_densification_mask(self, selected_mask):
+        if selected_mask.shape[0] != self.get_xyz.shape[0]:
+            raise ValueError("selected_mask first dimension must match the current Gaussian count.")
+        return selected_mask.to(device=self.get_xyz.device, dtype=torch.bool)
 
+    def _trim_mask_to_count(self, selected_mask, max_count):
+        if max_count is None:
+            return selected_mask
+        if max_count < 0:
+            raise ValueError("max_count must be non-negative.")
+        selected_indices = torch.nonzero(selected_mask, as_tuple=False).squeeze(1)
+        if selected_indices.shape[0] <= max_count:
+            return selected_mask
+        trimmed_mask = torch.zeros_like(selected_mask, dtype=torch.bool)
+        trimmed_mask[selected_indices[:max_count]] = True
+        return trimmed_mask
+
+    def _tmp_radii_for_mask(self, selected_mask):
+        if not hasattr(self, "tmp_radii") or self.tmp_radii is None:
+            return torch.zeros((selected_mask.sum()), device="cuda")
+        return self.tmp_radii[selected_mask]
+
+    def densify_and_split_by_mask(self, selected_mask, grads=None, scene_extent=None, N=2):
+        selected_pts_mask = self._validate_densification_mask(selected_mask)
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
         samples = torch.normal(mean=means, std=stds)
@@ -425,18 +582,26 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
-        new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
+        new_tmp_radii = self._tmp_radii_for_mask(selected_pts_mask).repeat(N)
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
+        self._append_structural_state(selected_pts_mask, source_type=2, repeat_count=N)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+        n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
-        selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
+        padded_grad = torch.zeros((n_init_points), device="cuda")
+        padded_grad[:grads.shape[0]] = grads.squeeze()
+        selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
-                                              torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
+                                              torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        self.densify_and_split_by_mask(selected_pts_mask, grads, scene_extent, N)
+
+    def densify_and_clone_by_mask(self, selected_mask, grads=None, scene_extent=None):
+        selected_pts_mask = self._validate_densification_mask(selected_mask)
         
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
@@ -445,24 +610,76 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
-        new_tmp_radii = self.tmp_radii[selected_pts_mask]
+        new_tmp_radii = self._tmp_radii_for_mask(selected_pts_mask)
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
+        self._append_structural_state(selected_pts_mask, source_type=1)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
-        grads = self.xyz_gradient_accum / self.denom
-        grads[grads.isnan()] = 0.0
+    def densify_and_clone(self, grads, grad_threshold, scene_extent):
+        # Extract points that satisfy the gradient condition
+        selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
+        selected_pts_mask = torch.logical_and(selected_pts_mask,
+                                              torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
+        self.densify_and_clone_by_mask(selected_pts_mask, grads, scene_extent)
 
-        self.tmp_radii = radii
+    def action_cost(self, action, N=2):
+        if action == "clone":
+            return 1
+        if action == "split":
+            return N - 1
+        raise ValueError(f"Unknown densification action: {action}")
+
+    def densify_with_budget(self, clone_mask, split_mask, budget, max_gaussians=None, scene_extent=None):
+        clone_mask = self._validate_densification_mask(clone_mask)
+        split_mask = self._validate_densification_mask(split_mask)
+        if clone_mask.shape[0] != split_mask.shape[0]:
+            raise ValueError("clone_mask and split_mask must have the same length.")
+        if torch.logical_and(clone_mask, split_mask).any():
+            raise ValueError("clone_mask and split_mask cannot select the same Gaussian.")
+        if budget < 0:
+            raise ValueError("budget must be non-negative.")
+
+        action_cost = {"clone": self.action_cost("clone"), "split": self.action_cost("split")}
+        max_actions = budget
+        if max_gaussians is not None:
+            max_actions = min(max_actions, max_gaussians - self.get_xyz.shape[0])
+        max_actions = max(0, max_actions)
+        if max_actions == 0:
+            return
+
+        clone_count = min(int(clone_mask.sum().item()), max_actions // action_cost["clone"])
+        clone_mask = self._trim_mask_to_count(clone_mask, clone_count)
+        remaining_actions = max_actions - clone_count * action_cost["clone"]
+        split_count = min(int(split_mask.sum().item()), remaining_actions // action_cost["split"])
+        split_mask = self._trim_mask_to_count(split_mask, split_count)
+        if not clone_mask.any() and not split_mask.any():
+            return
+
+        n_init_points = self.get_xyz.shape[0]
+        self.densify_and_clone_by_mask(clone_mask, scene_extent=scene_extent)
+        if self.get_xyz.shape[0] > n_init_points:
+            split_mask = torch.cat((split_mask, torch.zeros(self.get_xyz.shape[0] - n_init_points, device="cuda", dtype=bool)))
+        self.densify_and_split_by_mask(split_mask, scene_extent=scene_extent)
+
+    def apply_densification(self, grads, max_grad, extent):
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
 
+    def apply_standard_pruning(self, min_opacity, extent, max_screen_size):
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
+
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
+        grads = self.xyz_gradient_accum / self.denom
+        grads[grads.isnan()] = 0.0
+
+        self.tmp_radii = radii
+        self.apply_densification(grads, max_grad, extent)
+        self.apply_standard_pruning(min_opacity, extent, max_screen_size)
         tmp_radii = self.tmp_radii
         self.tmp_radii = None
 
