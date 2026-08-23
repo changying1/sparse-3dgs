@@ -736,13 +736,22 @@ class GaussianModel:
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
 
-    def apply_standard_pruning(self, min_opacity, extent, max_screen_size):
+    def apply_standard_pruning(self, min_opacity, extent, max_screen_size, return_stats=False):
+        before_prune = self.get_xyz.shape[0]
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
+        if return_stats:
+            after_prune = self.get_xyz.shape[0]
+            return {
+                "before_prune": before_prune,
+                "after_prune": after_prune,
+                "pruned": before_prune - after_prune,
+            }
+        return None
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
         grads = self.xyz_gradient_accum / self.denom

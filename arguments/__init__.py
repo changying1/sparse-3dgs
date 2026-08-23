@@ -34,6 +34,8 @@ class ParamGroup:
             else:
                 if t == bool:
                     group.add_argument("--" + key, default=value, action="store_true")
+                elif t == type(None):
+                    group.add_argument("--" + key, default=value)
                 else:
                     group.add_argument("--" + key, default=value, type=t)
 
@@ -101,6 +103,14 @@ class OptimizationParams(ParamGroup):
         self.value_warmup = 3000
         self.value_interval = 100
         self.knn_k = 12
+        self.tau_e = None
+        self.tau_s = None
+        self.omega_boundary = None
+        self.omega_turning = None
+        self.omega_defect = None
+        self.lambda_redundancy = None
+        self.normalization_low_quantile = 0.05
+        self.normalization_high_quantile = 0.95
         self.enable_gestalt_loss = False
         self.gestalt_warmup = 5000
         self.lambda_gestalt = 0.01

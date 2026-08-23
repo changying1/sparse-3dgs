@@ -10,6 +10,7 @@
 #
 
 import os
+import time
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -17,6 +18,27 @@ from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
+from utils.budget_densification import build_official_clone_split_masks
+from utils.edge_support import aggregate_multiview_edge_support, compute_edge_map
+from utils.structural_graph import (
+    build_knn_graph,
+    compute_continuity_defect,
+    compute_geometric_turning,
+    compute_redundancy,
+    estimate_gaussian_normals,
+)
+from utils.training_mode_utils import (
+    compute_effective_densification_budget,
+    should_run_densification,
+    validate_densification_mode,
+)
+from utils.value_allocation import (
+    allocate_budget,
+    compute_observation_scarcity,
+    compute_refine_utility,
+    compute_structural_value,
+    robust_normalize,
+)
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -44,6 +66,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
+    densification_mode = validate_densification_mode(opt)
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -53,7 +76,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
-    gaussians.ensure_visibility_history(len(scene.getTrainCameras()))
+    train_cameras = scene.getTrainCameras()
+    gaussians.ensure_visibility_history(len(train_cameras))
+    camera_uid_to_train_index = {
+        camera.uid: index
+        for index, camera in enumerate(train_cameras)
+    }
+    value_edge_maps = initialize_value_edge_maps(train_cameras) if densification_mode == "value_allocation" else None
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -64,7 +93,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
-    viewpoint_stack = scene.getTrainCameras().copy()
+    viewpoint_stack = train_cameras.copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
@@ -97,7 +126,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Pick a random Camera
         if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
+            viewpoint_stack = train_cameras.copy()
             viewpoint_indices = list(range(len(viewpoint_stack)))
         rand_idx = randint(0, len(viewpoint_indices) - 1)
         viewpoint_cam = viewpoint_stack.pop(rand_idx)
@@ -168,9 +197,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                if should_run_densification(iteration, opt.densify_from_iter, opt.densify_until_iter, opt.densification_interval):
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    if densification_mode == "official":
+                        gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    elif densification_mode == "budget_gradient":
+                        apply_budget_gradient_densification(gaussians, opt, scene.cameras_extent, size_threshold, radii, iteration)
+                    elif densification_mode == "value_allocation":
+                        apply_value_allocation_densification(
+                            gaussians,
+                            opt,
+                            train_cameras,
+                            value_edge_maps,
+                            camera_uid_to_train_index,
+                            scene.cameras_extent,
+                            size_threshold,
+                            radii,
+                            iteration,
+                        )
+                    else:
+                        raise ValueError(f"Unknown densification_mode '{densification_mode}'.")
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -192,6 +238,184 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
     print_visibility_statistics(gaussians)
+
+def initialize_value_edge_maps(train_cameras):
+    edge_maps = []
+    with torch.no_grad():
+        for camera in train_cameras:
+            edge_maps.append(compute_edge_map(camera.original_image.detach().cpu()).cpu())
+    return edge_maps
+
+def apply_budget_gradient_densification(gaussians, opt, extent, size_threshold, radii, iteration):
+    _sync_cuda_for_timing()
+    densification_start = time.perf_counter()
+    gaussians.tmp_radii = radii
+    try:
+        densify_stats = gaussians.densify_gradient_topk_with_budget(
+            budget=opt.densification_budget,
+            scene_extent=extent,
+            max_gaussians=opt.max_gaussians,
+            return_stats=True,
+        )
+        prune_stats = gaussians.apply_standard_pruning(0.005, extent, size_threshold, return_stats=True)
+    finally:
+        gaussians.tmp_radii = None
+    _sync_cuda_for_timing()
+    densification_time = time.perf_counter() - densification_start
+
+    densify_stats["pruned"] = prune_stats["pruned"]
+    densify_stats["final_count"] = gaussians.get_xyz.shape[0]
+    print_densification_log(
+        mode="budget_gradient",
+        iteration=iteration,
+        stats=densify_stats,
+        densification_time=densification_time,
+    )
+
+def apply_value_allocation_densification(
+    gaussians,
+    opt,
+    train_cameras,
+    edge_maps,
+    camera_uid_to_train_index,
+    extent,
+    size_threshold,
+    radii,
+    iteration,
+):
+    device = gaussians.get_xyz.device
+    _sync_cuda_for_timing()
+    graph_start = time.perf_counter()
+    neighbor_indices = build_knn_graph(gaussians.get_xyz, k=opt.knn_k)
+    normals = estimate_gaussian_normals(gaussians.get_scaling, gaussians.get_rotation)
+    turning = compute_geometric_turning(gaussians.get_xyz, normals, neighbor_indices)
+    defect = compute_continuity_defect(gaussians.get_xyz, normals, neighbor_indices)
+    redundancy = compute_redundancy(gaussians.get_xyz, gaussians.get_scaling, neighbor_indices)
+    _sync_cuda_for_timing()
+    graph_build_time = time.perf_counter() - graph_start
+
+    value_start = time.perf_counter()
+    observation = compute_observation_scarcity(gaussians.visible_view_count, opt.tau_e, opt.tau_s).to(device=device)
+    boundary = aggregate_multiview_edge_support(
+        xyz=gaussians.get_xyz,
+        cameras=train_cameras,
+        edge_maps=edge_maps,
+        visibility_history=gaussians.visibility_history,
+        camera_uid_to_train_index=camera_uid_to_train_index,
+    )
+    boundary_norm = robust_normalize(boundary, opt.normalization_low_quantile, opt.normalization_high_quantile)
+    turning_norm = robust_normalize(turning, opt.normalization_low_quantile, opt.normalization_high_quantile)
+    defect_norm = robust_normalize(defect, opt.normalization_low_quantile, opt.normalization_high_quantile)
+    redundancy_norm = robust_normalize(redundancy, opt.normalization_low_quantile, opt.normalization_high_quantile)
+    structural_value = compute_structural_value(
+        boundary_norm,
+        turning_norm,
+        defect_norm,
+        opt.omega_boundary,
+        opt.omega_turning,
+        opt.omega_defect,
+    )
+    utility = compute_refine_utility(
+        observation,
+        structural_value,
+        redundancy_norm,
+        opt.lambda_redundancy,
+    )
+    effective_budget = compute_effective_densification_budget(
+        opt.densification_budget,
+        opt.max_gaussians,
+        gaussians.get_xyz.shape[0],
+    )
+    # Candidate pool optimization is deferred for Phase 9 to avoid introducing
+    # uncalibrated thresholds into the first Value Top-k experiment.
+    selected_mask = allocate_budget(utility, effective_budget, candidate_mask=None, return_mask=True)
+    clone_mask, split_mask = build_official_clone_split_masks(
+        selected_mask,
+        gaussians.get_scaling,
+        gaussians.percent_dense,
+        extent,
+    )
+    _sync_cuda_for_timing()
+    value_compute_time = time.perf_counter() - value_start
+
+    densification_start = time.perf_counter()
+    gaussians.tmp_radii = radii
+    try:
+        densify_stats = gaussians.densify_with_budget(
+            clone_mask,
+            split_mask,
+            budget=opt.densification_budget,
+            max_gaussians=opt.max_gaussians,
+            scene_extent=extent,
+            return_stats=True,
+        )
+        prune_stats = gaussians.apply_standard_pruning(0.005, extent, size_threshold, return_stats=True)
+    finally:
+        gaussians.tmp_radii = None
+    _sync_cuda_for_timing()
+    densification_time = time.perf_counter() - densification_start
+
+    densify_stats["value_selected"] = int(selected_mask.sum().item())
+    densify_stats["pruned"] = prune_stats["pruned"]
+    densify_stats["final_count"] = gaussians.get_xyz.shape[0]
+    print_densification_log(
+        mode="value_allocation",
+        iteration=iteration,
+        stats=densify_stats,
+        value_stats={
+            "mean_O": observation.mean().item() if observation.numel() else 0.0,
+            "mean_B": boundary.mean().item() if boundary.numel() else 0.0,
+            "mean_K": turning.mean().item() if turning.numel() else 0.0,
+            "mean_D": defect.mean().item() if defect.numel() else 0.0,
+            "mean_R": redundancy.mean().item() if redundancy.numel() else 0.0,
+            "mean_U": utility.mean().item() if utility.numel() else 0.0,
+            "max_U": utility.max().item() if utility.numel() else 0.0,
+        },
+        graph_build_time=graph_build_time,
+        value_compute_time=value_compute_time,
+        densification_time=densification_time,
+    )
+
+def print_densification_log(
+    mode,
+    iteration,
+    stats,
+    value_stats=None,
+    graph_build_time=None,
+    value_compute_time=None,
+    densification_time=None,
+):
+    message = (
+        f"\n[ITER {iteration}] densification mode={mode} "
+        f"count={stats['final_count']} "
+        f"requested_budget={stats['requested_budget']} "
+        f"effective_budget={stats['effective_budget']} "
+        f"clone={stats['clone_selected']} "
+        f"split={stats['split_selected']} "
+        f"net_added={stats['densification_net_added']} "
+        f"pruned={stats['pruned']}"
+    )
+    if value_stats is not None:
+        message += (
+            f" mean_O={value_stats['mean_O']:.6f}"
+            f" mean_B={value_stats['mean_B']:.6f}"
+            f" mean_K={value_stats['mean_K']:.6f}"
+            f" mean_D={value_stats['mean_D']:.6f}"
+            f" mean_R={value_stats['mean_R']:.6f}"
+            f" mean_U={value_stats['mean_U']:.6f}"
+            f" max_U={value_stats['max_U']:.6f}"
+        )
+    if graph_build_time is not None:
+        message += f" graph_build_time={graph_build_time:.4f}s"
+    if value_compute_time is not None:
+        message += f" value_compute_time={value_compute_time:.4f}s"
+    if densification_time is not None:
+        message += f" densification_time={densification_time:.4f}s"
+    print(message)
+
+def _sync_cuda_for_timing():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
