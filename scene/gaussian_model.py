@@ -21,6 +21,11 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+from utils.budget_densification import (
+    build_official_clone_split_masks,
+    compute_gradient_score,
+    select_gradient_topk,
+)
 
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
@@ -629,7 +634,7 @@ class GaussianModel:
             return N - 1
         raise ValueError(f"Unknown densification action: {action}")
 
-    def densify_with_budget(self, clone_mask, split_mask, budget, max_gaussians=None, scene_extent=None):
+    def densify_with_budget(self, clone_mask, split_mask, budget, max_gaussians=None, scene_extent=None, split_N=2, return_stats=False):
         clone_mask = self._validate_densification_mask(clone_mask)
         split_mask = self._validate_densification_mask(split_mask)
         if clone_mask.shape[0] != split_mask.shape[0]:
@@ -638,28 +643,94 @@ class GaussianModel:
             raise ValueError("clone_mask and split_mask cannot select the same Gaussian.")
         if budget < 0:
             raise ValueError("budget must be non-negative.")
+        if split_N < 2:
+            raise ValueError("split_N must be at least 2.")
 
-        action_cost = {"clone": self.action_cost("clone"), "split": self.action_cost("split")}
-        max_actions = budget
+        before_count = self.get_xyz.shape[0]
+        action_cost = {"clone": self.action_cost("clone"), "split": self.action_cost("split", N=split_N)}
+        requested_budget = int(budget)
+        effective_budget = requested_budget
         if max_gaussians is not None:
-            max_actions = min(max_actions, max_gaussians - self.get_xyz.shape[0])
-        max_actions = max(0, max_actions)
-        if max_actions == 0:
-            return
+            effective_budget = min(effective_budget, max_gaussians - before_count)
+        effective_budget = max(0, effective_budget)
 
-        clone_count = min(int(clone_mask.sum().item()), max_actions // action_cost["clone"])
-        clone_mask = self._trim_mask_to_count(clone_mask, clone_count)
-        remaining_actions = max_actions - clone_count * action_cost["clone"]
-        split_count = min(int(split_mask.sum().item()), remaining_actions // action_cost["split"])
-        split_mask = self._trim_mask_to_count(split_mask, split_count)
+        selected_clone_mask = torch.zeros_like(clone_mask, dtype=torch.bool)
+        selected_split_mask = torch.zeros_like(split_mask, dtype=torch.bool)
+        remaining_budget = effective_budget
+        for action, mask in (("clone", clone_mask), ("split", split_mask)):
+            cost = action_cost[action]
+            if cost <= 0:
+                raise ValueError("densification action cost must be positive.")
+            if remaining_budget < cost:
+                continue
+            count = min(int(mask.sum().item()), remaining_budget // cost)
+            trimmed_mask = self._trim_mask_to_count(mask, count)
+            if action == "clone":
+                selected_clone_mask = trimmed_mask
+            else:
+                selected_split_mask = trimmed_mask
+            remaining_budget -= int(trimmed_mask.sum().item()) * cost
+
+        clone_mask = selected_clone_mask
+        split_mask = selected_split_mask
+        net_added = int(clone_mask.sum().item()) * action_cost["clone"] + int(split_mask.sum().item()) * action_cost["split"]
+        stats = {
+            "requested_budget": requested_budget,
+            "effective_budget": effective_budget,
+            "clone_selected": int(clone_mask.sum().item()),
+            "split_selected": int(split_mask.sum().item()),
+            "densification_net_added": net_added,
+            "before_count": before_count,
+            "after_densification_count": before_count,
+            "pruned": 0,
+        }
         if not clone_mask.any() and not split_mask.any():
-            return
+            return stats if return_stats else None
 
         n_init_points = self.get_xyz.shape[0]
         self.densify_and_clone_by_mask(clone_mask, scene_extent=scene_extent)
         if self.get_xyz.shape[0] > n_init_points:
             split_mask = torch.cat((split_mask, torch.zeros(self.get_xyz.shape[0] - n_init_points, device="cuda", dtype=bool)))
-        self.densify_and_split_by_mask(split_mask, scene_extent=scene_extent)
+        self.densify_and_split_by_mask(split_mask, scene_extent=scene_extent, N=split_N)
+        stats["after_densification_count"] = self.get_xyz.shape[0]
+        return stats if return_stats else None
+
+    def select_gradient_densification_masks(self, budget, scene_extent, max_gaussians=None, candidate_mask=None):
+        gradient_score = compute_gradient_score(self.xyz_gradient_accum, self.denom)
+        effective_budget = int(budget)
+        if max_gaussians is not None:
+            effective_budget = min(effective_budget, max_gaussians - self.get_xyz.shape[0])
+        effective_budget = max(0, effective_budget)
+        selected_mask = select_gradient_topk(gradient_score, effective_budget, candidate_mask=candidate_mask, return_mask=True)
+        clone_mask, split_mask = build_official_clone_split_masks(
+            selected_mask,
+            self.get_scaling,
+            self.percent_dense,
+            scene_extent,
+        )
+        if torch.logical_and(clone_mask, split_mask).any():
+            raise RuntimeError("clone and split masks must be disjoint.")
+        return clone_mask, split_mask, gradient_score, selected_mask
+
+    def densify_gradient_topk_with_budget(self, budget, scene_extent, max_gaussians=None, candidate_mask=None, split_N=2, return_stats=False):
+        clone_mask, split_mask, gradient_score, selected_mask = self.select_gradient_densification_masks(
+            budget=budget,
+            scene_extent=scene_extent,
+            max_gaussians=max_gaussians,
+            candidate_mask=candidate_mask,
+        )
+        stats = self.densify_with_budget(
+            clone_mask,
+            split_mask,
+            budget=budget,
+            max_gaussians=max_gaussians,
+            scene_extent=scene_extent,
+            split_N=split_N,
+            return_stats=True,
+        )
+        stats["gradient_selected"] = int(selected_mask.sum().item())
+        stats["gradient_score"] = gradient_score
+        return stats if return_stats else None
 
     def apply_densification(self, grads, max_grad, extent):
         self.densify_and_clone(grads, max_grad, extent)
