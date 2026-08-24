@@ -114,6 +114,9 @@ class OptimizationParams(ParamGroup):
         self.enable_gestalt_loss = False
         self.gestalt_warmup = 5000
         self.lambda_gestalt = 0.01
+        self.lambda_normal = 1.0
+        self.gestalt_edge_sample_num = 20000
+        self.gestalt_graph_refresh_interval = 100
         self.experiment_seed = 0
         self.structural_log_interval = 100
         self.save_value_maps = False

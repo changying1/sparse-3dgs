@@ -5,7 +5,7 @@ import math
 
 SUPPORTED_DENSIFICATION_MODES = ("official", "budget_gradient", "value_allocation")
 UNIMPLEMENTED_DENSIFICATION_MODES = {
-    "value_gestalt": "value_gestalt requires Phase 10.",
+    "value_gestalt": "value_gestalt training integration requires Phase 10.4.",
     "full": "full requires Phase 11.",
 }
 VALUE_REQUIRED_PARAMS = (
@@ -73,6 +73,33 @@ def validate_densification_mode(opt):
     return mode
 
 
+def validate_gestalt_parameters(opt):
+    if hasattr(opt, "enable_gestalt_loss") and not isinstance(opt.enable_gestalt_loss, bool):
+        raise ValueError("enable_gestalt_loss must be a bool.")
+
+    opt.gestalt_warmup = _require_int(opt, "gestalt_warmup")
+    opt.lambda_gestalt = _to_float(_require_attr(opt, "lambda_gestalt"), "lambda_gestalt")
+    opt.lambda_normal = _to_float(_require_attr(opt, "lambda_normal"), "lambda_normal")
+    opt.gestalt_edge_sample_num = _require_int(opt, "gestalt_edge_sample_num")
+    opt.gestalt_graph_refresh_interval = _require_int(opt, "gestalt_graph_refresh_interval")
+
+    if opt.gestalt_warmup < 0:
+        raise ValueError("gestalt_warmup must be non-negative.")
+    if not math.isfinite(opt.lambda_gestalt):
+        raise ValueError("lambda_gestalt must be finite.")
+    if opt.lambda_gestalt < 0:
+        raise ValueError("lambda_gestalt must be non-negative.")
+    if not math.isfinite(opt.lambda_normal):
+        raise ValueError("lambda_normal must be finite.")
+    if opt.lambda_normal < 0:
+        raise ValueError("lambda_normal must be non-negative.")
+    if opt.gestalt_edge_sample_num <= 0:
+        raise ValueError("gestalt_edge_sample_num must be positive.")
+    if opt.gestalt_graph_refresh_interval <= 0:
+        raise ValueError("gestalt_graph_refresh_interval must be positive.")
+    return opt
+
+
 def compute_effective_densification_budget(budget, max_gaussians, current_gaussian_count):
     if budget < 0:
         raise ValueError("densification budget must be non-negative.")
@@ -97,3 +124,16 @@ def _to_float(value, name):
         return float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be a numeric value.") from exc
+
+
+def _require_attr(opt, name):
+    if not hasattr(opt, name):
+        raise ValueError(f"{name} is required.")
+    return getattr(opt, name)
+
+
+def _require_int(opt, name):
+    value = _require_attr(opt, name)
+    if type(value) is not int:
+        raise ValueError(f"{name} must be an integer.")
+    return value
