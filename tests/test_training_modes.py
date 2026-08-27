@@ -90,9 +90,32 @@ def test_value_allocation_rejects_nan_lambda_redundancy():
         validate_densification_mode(opt)
 
 
-def test_value_gestalt_is_not_implemented_yet():
-    with pytest.raises(NotImplementedError, match="Phase 10.4"):
-        validate_densification_mode(_opt("value_gestalt"))
+def test_value_gestalt_is_supported_with_value_and_enabled_gestalt_parameters():
+    opt = _valid_value_gestalt_opt()
+
+    assert validate_densification_mode(opt) == "value_gestalt"
+
+
+def test_value_gestalt_missing_value_parameters_raises_value_error():
+    opt = _opt(
+        "value_gestalt",
+        enable_gestalt_loss=True,
+        gestalt_warmup=5000,
+        lambda_gestalt=0.01,
+        lambda_normal=1.0,
+        gestalt_edge_sample_num=20000,
+        gestalt_graph_refresh_interval=100,
+    )
+
+    with pytest.raises(ValueError, match="tau_e"):
+        validate_densification_mode(opt)
+
+
+def test_value_gestalt_requires_enabled_gestalt_loss():
+    opt = _valid_value_gestalt_opt(enable_gestalt_loss=False)
+
+    with pytest.raises(ValueError, match="enable_gestalt_loss"):
+        validate_densification_mode(opt)
 
 
 def test_full_is_not_implemented_yet():
@@ -231,3 +254,24 @@ def _valid_gestalt_opt(**overrides):
     }
     values.update(overrides)
     return Namespace(**values)
+
+
+def _valid_value_gestalt_opt(**overrides):
+    values = {
+        "tau_e": 2.0,
+        "tau_s": 10.0,
+        "omega_boundary": 1.0,
+        "omega_turning": 1.0,
+        "omega_defect": 1.0,
+        "lambda_redundancy": 0.0,
+        "normalization_low_quantile": 0.05,
+        "normalization_high_quantile": 0.95,
+        "enable_gestalt_loss": True,
+        "gestalt_warmup": 5000,
+        "lambda_gestalt": 0.01,
+        "lambda_normal": 1.0,
+        "gestalt_edge_sample_num": 20000,
+        "gestalt_graph_refresh_interval": 100,
+    }
+    values.update(overrides)
+    return _opt("value_gestalt", **values)

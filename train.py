@@ -20,6 +20,12 @@ from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
 from utils.budget_densification import build_official_clone_split_masks
 from utils.edge_support import aggregate_multiview_edge_support, compute_edge_map
+from utils.gestalt_loss import (
+    compute_normal_continuity_loss,
+    compute_plane_continuity_loss,
+    select_same_surface_edges,
+    subsample_edges,
+)
 from utils.structural_graph import (
     build_knn_graph,
     compute_continuity_defect,
@@ -67,6 +73,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
     densification_mode = validate_densification_mode(opt)
+    value_densification_mode = densification_mode in ("value_allocation", "value_gestalt")
+    use_gestalt_loss = densification_mode == "value_gestalt"
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -82,7 +90,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         camera.uid: index
         for index, camera in enumerate(train_cameras)
     }
-    value_edge_maps = initialize_value_edge_maps(train_cameras) if densification_mode == "value_allocation" else None
+    value_edge_maps = initialize_value_edge_maps(train_cameras) if value_densification_mode else None
+    gestalt_neighbor_indices = None
+    gestalt_graph_last_refresh = None
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -170,6 +180,51 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1depth = 0
 
+        gestalt_stats = None
+        if use_gestalt_loss and iteration > opt.gestalt_warmup:
+            gestalt_graph_build_time = 0.0
+            graph_cache_stale = (
+                gestalt_neighbor_indices is None
+                or gestalt_graph_last_refresh is None
+                or iteration - gestalt_graph_last_refresh >= opt.gestalt_graph_refresh_interval
+            )
+            if graph_cache_stale:
+                _sync_cuda_for_timing()
+                gestalt_graph_start = time.perf_counter()
+                gestalt_neighbor_indices = build_knn_graph(gaussians.get_xyz, k=opt.knn_k)
+                _sync_cuda_for_timing()
+                gestalt_graph_build_time = time.perf_counter() - gestalt_graph_start
+                gestalt_graph_last_refresh = iteration
+
+            _sync_cuda_for_timing()
+            gestalt_loss_start = time.perf_counter()
+            normals = estimate_gaussian_normals(gaussians.get_scaling, gaussians.get_rotation)
+            edges = select_same_surface_edges(
+                gaussians.get_xyz.detach(),
+                normals.detach(),
+                gestalt_neighbor_indices,
+                visible_view_count=gaussians.visible_view_count,
+                normal_threshold=0.9,
+                max_distance=None,
+            )
+            edges = subsample_edges(edges, opt.gestalt_edge_sample_num)
+            plane_loss = compute_plane_continuity_loss(gaussians.get_xyz, normals, edges)
+            normal_loss = compute_normal_continuity_loss(normals, edges)
+            gestalt_loss = plane_loss + float(opt.lambda_normal) * normal_loss
+            weighted_gestalt_loss = float(opt.lambda_gestalt) * gestalt_loss
+            loss = loss + weighted_gestalt_loss
+            _sync_cuda_for_timing()
+            gestalt_loss_time = time.perf_counter() - gestalt_loss_start
+            gestalt_stats = {
+                "edge_count": int(edges.shape[0]),
+                "plane_loss": plane_loss,
+                "normal_loss": normal_loss,
+                "gestalt_loss": gestalt_loss,
+                "weighted_gestalt_loss": weighted_gestalt_loss,
+                "gestalt_graph_build_time": gestalt_graph_build_time,
+                "gestalt_loss_time": gestalt_loss_time,
+            }
+
         loss.backward()
 
         iter_end.record()
@@ -187,6 +242,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+            if gestalt_stats is not None:
+                if tb_writer:
+                    tb_writer.add_scalar("gestalt/edge_count", gestalt_stats["edge_count"], iteration)
+                    tb_writer.add_scalar("gestalt/plane_loss", gestalt_stats["plane_loss"].item(), iteration)
+                    tb_writer.add_scalar("gestalt/normal_loss", gestalt_stats["normal_loss"].item(), iteration)
+                    tb_writer.add_scalar("gestalt/loss", gestalt_stats["gestalt_loss"].item(), iteration)
+                    tb_writer.add_scalar("gestalt/weighted_loss", gestalt_stats["weighted_gestalt_loss"].item(), iteration)
+                    tb_writer.add_scalar("gestalt/graph_build_time", gestalt_stats["gestalt_graph_build_time"], iteration)
+                    tb_writer.add_scalar("gestalt/loss_time", gestalt_stats["gestalt_loss_time"], iteration)
+                if iteration % opt.structural_log_interval == 0:
+                    print_gestalt_log(iteration, gestalt_stats)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -203,7 +269,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
                     elif densification_mode == "budget_gradient":
                         apply_budget_gradient_densification(gaussians, opt, scene.cameras_extent, size_threshold, radii, iteration)
-                    elif densification_mode == "value_allocation":
+                    elif densification_mode in ("value_allocation", "value_gestalt"):
                         apply_value_allocation_densification(
                             gaussians,
                             opt,
@@ -214,9 +280,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             size_threshold,
                             radii,
                             iteration,
+                            mode=densification_mode,
                         )
                     else:
                         raise ValueError(f"Unknown densification_mode '{densification_mode}'.")
+                    if use_gestalt_loss:
+                        gestalt_neighbor_indices = None
+                        gestalt_graph_last_refresh = None
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -282,6 +352,7 @@ def apply_value_allocation_densification(
     size_threshold,
     radii,
     iteration,
+    mode="value_allocation",
 ):
     device = gaussians.get_xyz.device
     _sync_cuda_for_timing()
@@ -359,7 +430,7 @@ def apply_value_allocation_densification(
     densify_stats["pruned"] = prune_stats["pruned"]
     densify_stats["final_count"] = gaussians.get_xyz.shape[0]
     print_densification_log(
-        mode="value_allocation",
+        mode=mode,
         iteration=iteration,
         stats=densify_stats,
         value_stats={
@@ -375,6 +446,19 @@ def apply_value_allocation_densification(
         value_compute_time=value_compute_time,
         densification_time=densification_time,
     )
+
+def print_gestalt_log(iteration, stats):
+    message = (
+        f"\n[ITER {iteration}] gestalt "
+        f"edge_count={stats['edge_count']} "
+        f"plane_loss={stats['plane_loss'].item():.6f} "
+        f"normal_loss={stats['normal_loss'].item():.6f} "
+        f"gestalt_loss={stats['gestalt_loss'].item():.6f} "
+        f"weighted_gestalt_loss={stats['weighted_gestalt_loss'].item():.6f} "
+        f"gestalt_graph_build_time={stats['gestalt_graph_build_time']:.4f}s "
+        f"gestalt_loss_time={stats['gestalt_loss_time']:.4f}s"
+    )
+    print(message)
 
 def print_densification_log(
     mode,

@@ -13,7 +13,7 @@ import os
 import random
 import json
 from utils.system_utils import searchForMaxIteration
-from scene.dataset_readers import sceneLoadTypeCallbacks
+from scene.dataset_readers import apply_sparse_view_split, getNerfppNorm, load_sparse_init_point_cloud, sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
@@ -48,6 +48,15 @@ class Scene:
         else:
             assert False, "Could not recognize scene type!"
 
+        train_views_file = _resolve_split_file(args.source_path, getattr(args, "train_views_file", ""))
+        test_views_file = _resolve_split_file(args.source_path, getattr(args, "test_views_file", ""))
+        scene_info = apply_sparse_view_split(scene_info, train_views_file, test_views_file)
+        if train_views_file or test_views_file:
+            scene_info = scene_info._replace(
+                nerf_normalization=getNerfppNorm(scene_info.train_cameras)
+            )
+        scene_info = load_sparse_init_point_cloud(scene_info, getattr(args, "sparse_init_model_path", ""))
+
         if not self.loaded_iter:
             with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
                 dest_file.write(src_file.read())
@@ -67,6 +76,14 @@ class Scene:
             random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
 
         self.cameras_extent = scene_info.nerf_normalization["radius"]
+        print(
+            "[Sparse Init] "
+            f"train_views={len(scene_info.train_cameras)} "
+            f"test_views={len(scene_info.test_cameras)} "
+            f"initial_points={_point_cloud_count(scene_info.point_cloud)} "
+            f"initialization_path={scene_info.ply_path} "
+            f"camera_extent={self.cameras_extent}"
+        )
 
         for resolution_scale in resolution_scales:
             print("Loading Training Cameras")
@@ -98,3 +115,15 @@ class Scene:
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
+
+def _resolve_split_file(source_path, split_file):
+    if not split_file:
+        return ""
+    if os.path.isabs(split_file):
+        return split_file
+    return os.path.join(source_path, split_file)
+
+def _point_cloud_count(point_cloud):
+    if point_cloud is None:
+        return 0
+    return len(point_cloud.points)

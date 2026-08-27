@@ -45,6 +45,60 @@ class SceneInfo(NamedTuple):
     ply_path: str
     is_nerf_synthetic: bool
 
+def read_view_name_file(path):
+    names = []
+    seen = set()
+    with open(path, "r") as file:
+        for line_number, line in enumerate(file, start=1):
+            name = line.strip()
+            if not name or name.startswith("#"):
+                continue
+            if name in seen:
+                raise ValueError(f"Duplicate camera name '{name}' in {path}:{line_number}.")
+            seen.add(name)
+            names.append(name)
+    return names
+
+def apply_sparse_view_split(scene_info, train_views_file="", test_views_file=""):
+    if not train_views_file and not test_views_file:
+        return scene_info
+
+    all_cameras = sorted(
+        list(scene_info.train_cameras) + list(scene_info.test_cameras),
+        key=lambda camera: camera.image_name,
+    )
+    camera_by_name = {}
+    for camera in all_cameras:
+        if camera.image_name in camera_by_name:
+            raise ValueError(f"Duplicate camera name '{camera.image_name}' in loaded scene.")
+        camera_by_name[camera.image_name] = camera
+
+    train_names = read_view_name_file(train_views_file) if train_views_file else None
+    test_names = read_view_name_file(test_views_file) if test_views_file else None
+
+    if train_names is None:
+        train_set = set(camera_by_name) - set(test_names)
+        train_names = [camera.image_name for camera in all_cameras if camera.image_name in train_set]
+    if test_names is None:
+        test_set = set(camera_by_name) - set(train_names)
+        test_names = [camera.image_name for camera in all_cameras if camera.image_name in test_set]
+
+    train_set = set(train_names)
+    test_set = set(test_names)
+    overlap = sorted(train_set & test_set)
+    if overlap:
+        raise ValueError("Sparse-view train/test split overlap: " + ", ".join(overlap))
+
+    requested = train_set | test_set
+    missing = sorted(name for name in requested if name not in camera_by_name)
+    if missing:
+        raise ValueError("Sparse-view split references unknown camera name(s): " + ", ".join(missing))
+
+    return scene_info._replace(
+        train_cameras=[camera_by_name[name] for name in train_names],
+        test_cameras=[camera_by_name[name] for name in test_names],
+    )
+
 def getNerfppNorm(cam_info):
     def get_center_and_diag(cam_centers):
         cam_centers = np.hstack(cam_centers)
@@ -124,6 +178,34 @@ def fetchPly(path):
     colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
     normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
+
+def load_sparse_init_point_cloud(scene_info, sparse_init_model_path=""):
+    if not sparse_init_model_path:
+        return scene_info
+
+    init_model_path = os.path.abspath(sparse_init_model_path)
+    if not os.path.isdir(init_model_path):
+        raise FileNotFoundError(f"sparse_init_model_path does not exist or is not a directory: {init_model_path}")
+
+    ply_path = os.path.join(init_model_path, "points3D.ply")
+    if not os.path.isfile(ply_path):
+        raise FileNotFoundError(f"sparse initialization points3D.ply not found: {ply_path}")
+
+    point_cloud = fetchPly(ply_path)
+    _validate_point_cloud(point_cloud, ply_path)
+    return scene_info._replace(point_cloud=point_cloud, ply_path=ply_path)
+
+def _validate_point_cloud(point_cloud, ply_path):
+    if point_cloud is None:
+        raise ValueError(f"Failed to load sparse initialization point cloud: {ply_path}")
+
+    points = np.asarray(point_cloud.points)
+    if points.shape[0] <= 0:
+        raise ValueError(f"Sparse initialization point cloud has no vertices: {ply_path}")
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"Sparse initialization point cloud xyz must have shape Nx3: {ply_path}")
+    if not np.isfinite(points).all():
+        raise ValueError(f"Sparse initialization point cloud contains non-finite xyz values: {ply_path}")
 
 def storePly(path, xyz, rgb):
     # Define the dtype for the structured array

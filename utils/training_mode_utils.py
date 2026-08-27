@@ -3,9 +3,8 @@
 import math
 
 
-SUPPORTED_DENSIFICATION_MODES = ("official", "budget_gradient", "value_allocation")
+SUPPORTED_DENSIFICATION_MODES = ("official", "budget_gradient", "value_allocation", "value_gestalt")
 UNIMPLEMENTED_DENSIFICATION_MODES = {
-    "value_gestalt": "value_gestalt training integration requires Phase 10.4.",
     "full": "full requires Phase 11.",
 }
 VALUE_REQUIRED_PARAMS = (
@@ -25,13 +24,22 @@ def validate_densification_mode(opt):
     if mode not in SUPPORTED_DENSIFICATION_MODES:
         raise ValueError(f"Unknown densification_mode '{mode}'.")
 
-    if mode != "value_allocation":
+    if mode not in ("value_allocation", "value_gestalt"):
         return mode
 
+    _validate_value_allocation_parameters(opt, mode)
+    if mode == "value_gestalt":
+        validate_gestalt_parameters(opt)
+        if not opt.enable_gestalt_loss:
+            raise ValueError("value_gestalt requires enable_gestalt_loss=True.")
+    return mode
+
+
+def _validate_value_allocation_parameters(opt, mode):
     missing = [name for name in VALUE_REQUIRED_PARAMS if getattr(opt, name, None) is None]
     if missing:
         raise ValueError(
-            "value_allocation requires explicit CLI values for: "
+            f"{mode} requires explicit CLI values for: "
             + ", ".join(missing)
         )
 
@@ -70,7 +78,6 @@ def validate_densification_mode(opt):
         raise ValueError("lambda_redundancy must be non-negative.")
     if not (0.0 <= opt.normalization_low_quantile < opt.normalization_high_quantile <= 1.0):
         raise ValueError("Require 0 <= normalization_low_quantile < normalization_high_quantile <= 1.")
-    return mode
 
 
 def validate_gestalt_parameters(opt):

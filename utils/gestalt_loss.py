@@ -152,6 +152,23 @@ def compute_gestalt_loss(
     }
 
 
+def subsample_edges(edges, max_edges):
+    """Deterministically subsample edges with uniform coverage."""
+    _validate_edges_tensor(edges)
+    if type(max_edges) is not int:
+        raise ValueError("max_edges must be an integer.")
+    if max_edges <= 0:
+        raise ValueError("max_edges must be positive.")
+
+    edge_count = edges.shape[0]
+    if edge_count <= max_edges:
+        return edges
+
+    indices = torch.linspace(0, edge_count - 1, steps=max_edges, device=edges.device)
+    indices = indices.round().to(dtype=torch.long)
+    return edges[indices]
+
+
 def _source_mean_edge_distance(distances, sources, n_points, eps):
     sums = torch.zeros((n_points,), dtype=distances.dtype, device=distances.device)
     counts = torch.zeros((n_points,), dtype=distances.dtype, device=distances.device)
@@ -198,15 +215,19 @@ def _validate_neighbors(neighbor_indices, n_points):
 
 
 def _validate_edges(edges, n_points):
-    if not torch.is_tensor(edges) or edges.ndim != 2 or edges.shape[1] != 2:
-        raise ValueError("edges must be a LongTensor[E, 2].")
-    if edges.dtype != torch.long:
-        raise ValueError("edges must have dtype torch.long.")
+    _validate_edges_tensor(edges)
     if edges.numel() > 0:
         if edges.min() < 0 or edges.max() >= n_points:
             raise ValueError("edges contains an out-of-range index.")
         if torch.any(edges[:, 0] == edges[:, 1]):
             raise ValueError("edges must not contain self edges.")
+
+
+def _validate_edges_tensor(edges):
+    if not torch.is_tensor(edges) or edges.ndim != 2 or edges.shape[1] != 2:
+        raise ValueError("edges must be a LongTensor[E, 2].")
+    if edges.dtype != torch.long:
+        raise ValueError("edges must have dtype torch.long.")
 
 
 def _validate_visible_view_count(visible_view_count, n_points):

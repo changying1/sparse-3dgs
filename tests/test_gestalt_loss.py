@@ -8,6 +8,7 @@ from utils.gestalt_loss import (
     compute_normal_continuity_loss,
     compute_plane_continuity_loss,
     select_same_surface_edges,
+    subsample_edges,
 )
 
 
@@ -162,6 +163,44 @@ def test_max_distance_filters_distant_pairs_only_when_provided():
     assert (2, 0) in unfiltered_pairs
     assert (0, 2) not in filtered_pairs
     assert (2, 0) not in filtered_pairs
+
+
+def test_subsample_edges_keeps_all_when_edge_count_is_within_budget():
+    edges = torch.tensor([[0, 1], [1, 2], [2, 3]], dtype=torch.long)
+
+    sampled = subsample_edges(edges, max_edges=3)
+
+    assert sampled is edges
+    assert torch.equal(sampled, edges)
+
+
+def test_subsample_edges_returns_exact_budget_without_prefix_bias():
+    edges = torch.stack((torch.arange(10), torch.arange(10) + 1), dim=-1).long()
+
+    sampled = subsample_edges(edges, max_edges=4)
+
+    assert sampled.shape == (4, 2)
+    assert not torch.equal(sampled, edges[:4])
+    assert torch.equal(sampled, edges[torch.tensor([0, 3, 6, 9])])
+
+
+def test_subsample_edges_is_deterministic():
+    edges = torch.stack((torch.arange(17), torch.arange(17) + 1), dim=-1).long()
+
+    first = subsample_edges(edges, max_edges=6)
+    second = subsample_edges(edges, max_edges=6)
+
+    assert torch.equal(first, second)
+
+
+def test_subsample_edges_handles_empty_edges_and_preserves_dtype_device():
+    edges = torch.empty((0, 2), dtype=torch.long)
+
+    sampled = subsample_edges(edges, max_edges=4)
+
+    assert sampled.shape == (0, 2)
+    assert sampled.dtype == edges.dtype
+    assert sampled.device == edges.device
 
 
 def test_zero_valid_edges_returns_zero_finite_losses():
