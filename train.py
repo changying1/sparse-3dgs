@@ -18,7 +18,11 @@ from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
-from utils.budget_densification import build_official_clone_split_masks
+from utils.budget_densification import (
+    build_official_clone_split_masks,
+    compute_gradient_score,
+    select_gradient_topk,
+)
 from utils.edge_support import aggregate_multiview_edge_support, compute_edge_map
 from utils.gestalt_loss import (
     compute_normal_continuity_loss,
@@ -44,6 +48,10 @@ from utils.value_allocation import (
     compute_refine_utility,
     compute_structural_value,
     robust_normalize,
+)
+from utils.value_diagnostics import (
+    compute_value_selection_diagnostics,
+    format_value_diagnostics_log,
 )
 import uuid
 from tqdm import tqdm
@@ -406,6 +414,31 @@ def apply_value_allocation_densification(
         gaussians.percent_dense,
         extent,
     )
+    gradient_score = compute_gradient_score(gaussians.xyz_gradient_accum, gaussians.denom)
+    gradient_selected_mask = select_gradient_topk(
+        gradient_score,
+        effective_budget,
+        candidate_mask=None,
+        return_mask=True,
+    )
+    value_diagnostics = compute_value_selection_diagnostics(
+        scaling=gaussians.get_scaling,
+        selected_mask=selected_mask,
+        clone_mask=clone_mask,
+        split_mask=split_mask,
+        percent_dense=gaussians.percent_dense,
+        scene_extent=extent,
+        gradient_score=gradient_score,
+        gradient_selected_mask=gradient_selected_mask,
+        official_gradient_threshold=opt.densify_grad_threshold,
+        source_type=gaussians.source_type,
+        boundary=boundary,
+        turning=turning,
+        defect=defect,
+        redundancy=redundancy,
+        utility=utility,
+    )
+    print(format_value_diagnostics_log(iteration, value_diagnostics))
     _sync_cuda_for_timing()
     value_compute_time = time.perf_counter() - value_start
 
