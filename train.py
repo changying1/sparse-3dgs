@@ -19,8 +19,11 @@ import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
 from utils.budget_densification import (
+    build_gradient_candidate_mask,
     build_official_clone_split_masks,
     compute_gradient_score,
+    select_gradient_gated_demand_value_topk,
+    select_gradient_gated_value_topk,
     select_gradient_topk,
 )
 from utils.edge_support import aggregate_multiview_edge_support, compute_edge_map
@@ -43,15 +46,20 @@ from utils.training_mode_utils import (
     validate_densification_mode,
 )
 from utils.value_allocation import (
-    allocate_budget,
+    compute_demand_weighted_value_score,
     compute_observation_scarcity,
     compute_refine_utility,
     compute_structural_value,
     robust_normalize,
+    select_gradient_priority_value_rerank_topk,
 )
 from utils.value_diagnostics import (
+    build_multiview_value_diagnostics,
     compute_value_selection_diagnostics,
+    compute_value_rerank_diagnostics,
+    format_multiview_value_diagnostics_log,
     format_value_diagnostics_log,
+    format_value_rerank_diagnostics_log,
 )
 import uuid
 from tqdm import tqdm
@@ -81,8 +89,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
     densification_mode = validate_densification_mode(opt)
-    value_densification_mode = densification_mode in ("value_allocation", "value_gestalt")
-    use_gestalt_loss = densification_mode == "value_gestalt"
+    value_densification_mode = densification_mode in (
+        "value_allocation",
+        "value_gestalt",
+        "demand_value",
+        "demand_value_gestalt",
+        "value_rerank",
+        "value_rerank_gestalt",
+    )
+    use_gestalt_loss = densification_mode in ("value_gestalt", "demand_value_gestalt", "value_rerank_gestalt")
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -277,7 +292,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
                     elif densification_mode == "budget_gradient":
                         apply_budget_gradient_densification(gaussians, opt, scene.cameras_extent, size_threshold, radii, iteration)
-                    elif densification_mode in ("value_allocation", "value_gestalt"):
+                    elif densification_mode in ("value_allocation", "value_gestalt", "demand_value", "demand_value_gestalt", "value_rerank", "value_rerank_gestalt"):
                         apply_value_allocation_densification(
                             gaussians,
                             opt,
@@ -405,16 +420,58 @@ def apply_value_allocation_densification(
         opt.max_gaussians,
         gaussians.get_xyz.shape[0],
     )
-    # Candidate pool optimization is deferred for Phase 9 to avoid introducing
-    # uncalibrated thresholds into the first Value Top-k experiment.
-    selected_mask = allocate_budget(utility, effective_budget, candidate_mask=None, return_mask=True)
+    gradient_score = compute_gradient_score(gaussians.xyz_gradient_accum, gaussians.denom)
+    allocation_score = None
+    value_selected_mask = None
+    value_rerank_diagnostics = None
+    if mode in ("demand_value", "demand_value_gestalt"):
+        allocation_score = compute_demand_weighted_value_score(gradient_score, utility)
+        selected_mask = select_gradient_gated_demand_value_topk(
+            utility,
+            effective_budget,
+            gradient_score,
+            opt.densify_grad_threshold,
+            return_mask=True,
+        )
+        value_selected_mask = select_gradient_gated_value_topk(
+            utility,
+            effective_budget,
+            gradient_score,
+            opt.densify_grad_threshold,
+            return_mask=True,
+        )
+    elif mode in ("value_rerank", "value_rerank_gestalt"):
+        gradient_candidate_mask = build_gradient_candidate_mask(gradient_score, opt.densify_grad_threshold)
+        selected_mask = select_gradient_priority_value_rerank_topk(
+            gradient_score,
+            utility,
+            gradient_candidate_mask,
+            effective_budget,
+            rerank_fraction=opt.value_rerank_fraction,
+            return_mask=True,
+        )
+        value_rerank_diagnostics = compute_value_rerank_diagnostics(
+            gradient_score=gradient_score,
+            utility=utility,
+            candidate_mask=gradient_candidate_mask,
+            selected_mask=selected_mask,
+            budget=effective_budget,
+            rerank_fraction=opt.value_rerank_fraction,
+        )
+    else:
+        selected_mask = select_gradient_gated_value_topk(
+            utility,
+            effective_budget,
+            gradient_score,
+            opt.densify_grad_threshold,
+            return_mask=True,
+        )
     clone_mask, split_mask = build_official_clone_split_masks(
         selected_mask,
         gaussians.get_scaling,
         gaussians.percent_dense,
         extent,
     )
-    gradient_score = compute_gradient_score(gaussians.xyz_gradient_accum, gaussians.denom)
     gradient_selected_mask = select_gradient_topk(
         gradient_score,
         effective_budget,
@@ -437,8 +494,31 @@ def apply_value_allocation_densification(
         defect=defect,
         redundancy=redundancy,
         utility=utility,
+        allocation_score=allocation_score,
     )
     print(format_value_diagnostics_log(iteration, value_diagnostics))
+    if value_rerank_diagnostics is not None:
+        print(format_value_rerank_diagnostics_log(iteration, value_rerank_diagnostics))
+    multiview_value_diagnostics = build_multiview_value_diagnostics(
+        scaling=gaussians.get_scaling,
+        selected_mask=selected_mask,
+        effective_budget=effective_budget,
+        gradient_score=gradient_score,
+        official_gradient_threshold=opt.densify_grad_threshold,
+        visible_view_count=gaussians.visible_view_count,
+        observation=observation,
+        boundary=boundary_norm,
+        turning=turning_norm,
+        defect=defect_norm,
+        redundancy=redundancy_norm,
+        utility=utility,
+        allocation_score=allocation_score,
+        structural_value=structural_value,
+        lambda_redundancy=opt.lambda_redundancy,
+        source_type=gaussians.source_type,
+        value_reference_mask=value_selected_mask,
+    )
+    print(format_multiview_value_diagnostics_log(iteration, multiview_value_diagnostics))
     _sync_cuda_for_timing()
     value_compute_time = time.perf_counter() - value_start
 
@@ -462,19 +542,24 @@ def apply_value_allocation_densification(
     densify_stats["value_selected"] = int(selected_mask.sum().item())
     densify_stats["pruned"] = prune_stats["pruned"]
     densify_stats["final_count"] = gaussians.get_xyz.shape[0]
+    value_stats = {
+        "mean_O": observation.mean().item() if observation.numel() else 0.0,
+        "mean_B": boundary.mean().item() if boundary.numel() else 0.0,
+        "mean_K": turning.mean().item() if turning.numel() else 0.0,
+        "mean_D": defect.mean().item() if defect.numel() else 0.0,
+        "mean_R": redundancy.mean().item() if redundancy.numel() else 0.0,
+        "mean_U": utility.mean().item() if utility.numel() else 0.0,
+        "max_U": utility.max().item() if utility.numel() else 0.0,
+    }
+    if allocation_score is not None:
+        value_stats["mean_A"] = allocation_score.mean().item() if allocation_score.numel() else 0.0
+        value_stats["max_A"] = allocation_score.max().item() if allocation_score.numel() else 0.0
+
     print_densification_log(
         mode=mode,
         iteration=iteration,
         stats=densify_stats,
-        value_stats={
-            "mean_O": observation.mean().item() if observation.numel() else 0.0,
-            "mean_B": boundary.mean().item() if boundary.numel() else 0.0,
-            "mean_K": turning.mean().item() if turning.numel() else 0.0,
-            "mean_D": defect.mean().item() if defect.numel() else 0.0,
-            "mean_R": redundancy.mean().item() if redundancy.numel() else 0.0,
-            "mean_U": utility.mean().item() if utility.numel() else 0.0,
-            "max_U": utility.max().item() if utility.numel() else 0.0,
-        },
+        value_stats=value_stats,
         graph_build_time=graph_build_time,
         value_compute_time=value_compute_time,
         densification_time=densification_time,
@@ -522,6 +607,11 @@ def print_densification_log(
             f" mean_U={value_stats['mean_U']:.6f}"
             f" max_U={value_stats['max_U']:.6f}"
         )
+        if "mean_A" in value_stats:
+            message += (
+                f" mean_A={value_stats['mean_A']:.6f}"
+                f" max_A={value_stats['max_A']:.6f}"
+            )
     if graph_build_time is not None:
         message += f" graph_build_time={graph_build_time:.4f}s"
     if value_compute_time is not None:

@@ -6,7 +6,7 @@ renderer, pruning, clone/split generation, losses, or structural metrics.
 
 import torch
 
-from utils.value_allocation import allocate_budget
+from utils.value_allocation import allocate_budget, compute_demand_weighted_value_score
 
 
 def compute_gradient_score(xyz_gradient_accum, denom):
@@ -46,6 +46,42 @@ def select_gradient_topk(gradient_score, budget, candidate_mask=None, return_mas
     """
     return allocate_budget(
         gradient_score,
+        budget=budget,
+        candidate_mask=candidate_mask,
+        return_mask=return_mask,
+    )
+
+
+def build_gradient_candidate_mask(gradient_score, grad_threshold):
+    """Return Gaussians with finite gradient demand at the official threshold."""
+    with torch.no_grad():
+        if not torch.is_tensor(gradient_score) or gradient_score.ndim != 1:
+            raise ValueError("gradient_score must be a Tensor[N].")
+        threshold = float(grad_threshold)
+        return torch.isfinite(gradient_score) & (gradient_score >= threshold)
+
+
+def select_gradient_gated_value_topk(utility, budget, gradient_score, grad_threshold, return_mask=False):
+    """Select Value Top-k only from Gaussians with real gradient demand."""
+    candidate_mask = build_gradient_candidate_mask(gradient_score, grad_threshold)
+    return allocate_budget(
+        utility,
+        budget=budget,
+        candidate_mask=candidate_mask,
+        return_mask=return_mask,
+    )
+
+
+def select_gradient_gated_demand_value_topk(utility, budget, gradient_score, grad_threshold, return_mask=False):
+    """Select Top-k by A_i = g_i * U_i inside the existing gradient gate."""
+    candidate_mask = build_gradient_candidate_mask(gradient_score, grad_threshold)
+    allocation_score = compute_demand_weighted_value_score(
+        gradient_score,
+        utility,
+        candidate_mask=candidate_mask,
+    )
+    return allocate_budget(
+        allocation_score,
         budget=budget,
         candidate_mask=candidate_mask,
         return_mask=return_mask,

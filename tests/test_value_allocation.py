@@ -4,9 +4,11 @@ import torch
 from utils.value_allocation import (
     allocate_budget,
     build_candidate_pool,
+    compute_demand_weighted_value_score,
     compute_refine_utility,
     compute_structural_value,
     robust_normalize,
+    select_gradient_priority_value_rerank_topk,
 )
 
 
@@ -151,6 +153,37 @@ def test_nan_and_inf_utility_are_not_selected():
     assert selected.tolist() == [3, 0]
 
 
+def test_demand_weighted_value_score_is_raw_gradient_times_utility():
+    gradient = torch.tensor([1.0, 2.0, 3.0])
+    utility = torch.tensor([3.0, 2.0, 1.0])
+
+    allocation_score = compute_demand_weighted_value_score(gradient, utility)
+
+    assert torch.allclose(allocation_score, torch.tensor([3.0, 4.0, 3.0]))
+
+
+def test_demand_weighted_value_score_does_not_mutate_inputs():
+    gradient = torch.tensor([1.0, 2.0, 3.0])
+    utility = torch.tensor([3.0, 2.0, 1.0])
+    gradient_before = gradient.clone()
+    utility_before = utility.clone()
+
+    compute_demand_weighted_value_score(gradient, utility)
+
+    assert torch.equal(gradient, gradient_before)
+    assert torch.equal(utility, utility_before)
+
+
+def test_demand_weighted_value_score_sanitizes_non_finite_inputs():
+    gradient = torch.tensor([1.0, float("nan"), float("inf"), 4.0])
+    utility = torch.tensor([2.0, 3.0, 4.0, float("inf")])
+
+    allocation_score = compute_demand_weighted_value_score(gradient, utility)
+
+    assert torch.isfinite(allocation_score).all()
+    assert torch.equal(allocation_score, torch.tensor([2.0, 0.0, 0.0, 0.0]))
+
+
 def test_return_mask_selects_highest_positive_utility_positions():
     utility = torch.tensor([0.2, 0.0, 0.9, 0.5])
 
@@ -169,6 +202,116 @@ def test_zero_budget_returns_empty_long_tensor():
 
     assert selected.dtype == torch.long
     assert selected.shape == (0,)
+
+
+def test_value_rerank_fraction_zero_matches_gradient_topk():
+    gradient = torch.tensor([10.0, 9.0, 8.0, 7.0, 6.0])
+    utility = torch.tensor([0.1, 100.0, 50.0, 0.2, 0.3])
+    candidate = torch.ones((5,), dtype=torch.bool)
+
+    selected = select_gradient_priority_value_rerank_topk(
+        gradient,
+        utility,
+        candidate,
+        budget=3,
+        rerank_fraction=0.0,
+    )
+
+    assert selected.tolist() == [0, 1, 2]
+
+
+def test_value_rerank_reorders_only_boundary_pool():
+    gradient = torch.tensor([10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0])
+    utility = torch.tensor([0.0, 0.0, 0.1, 0.2, 0.9, 0.8, 0.0, 0.0, 0.0, 1000.0])
+    candidate = torch.ones((10,), dtype=torch.bool)
+
+    selected = select_gradient_priority_value_rerank_topk(
+        gradient,
+        utility,
+        candidate,
+        budget=4,
+        rerank_fraction=0.5,
+    )
+
+    assert selected.tolist() == [0, 1, 4, 5]
+    assert 9 not in selected.tolist()
+
+
+def test_value_rerank_selects_all_when_eligible_count_is_within_budget():
+    gradient = torch.tensor([10.0, 9.0, 8.0, 7.0])
+    utility = torch.tensor([0.1, 0.2, 0.3, 0.4])
+    candidate = torch.tensor([True, False, True, False])
+
+    selected = select_gradient_priority_value_rerank_topk(
+        gradient,
+        utility,
+        candidate,
+        budget=3,
+        rerank_fraction=0.25,
+    )
+
+    assert selected.tolist() == [0, 2]
+
+
+def test_value_rerank_candidate_mask_excludes_extreme_scores():
+    gradient = torch.tensor([10.0, 9.0, 1000.0, 7.0])
+    utility = torch.tensor([0.1, 0.2, 1000.0, 0.4])
+    candidate = torch.tensor([True, True, False, True])
+
+    selected = select_gradient_priority_value_rerank_topk(
+        gradient,
+        utility,
+        candidate,
+        budget=2,
+        rerank_fraction=0.5,
+    )
+
+    assert 2 not in selected.tolist()
+
+
+def test_value_rerank_rejects_non_finite_gradient_or_utility():
+    gradient = torch.tensor([10.0, float("nan"), float("inf"), 7.0])
+    utility = torch.tensor([0.1, 0.2, 0.3, float("inf")])
+    candidate = torch.ones((4,), dtype=torch.bool)
+
+    selected = select_gradient_priority_value_rerank_topk(
+        gradient,
+        utility,
+        candidate,
+        budget=3,
+        rerank_fraction=0.5,
+    )
+
+    assert selected.tolist() == [0]
+
+
+def test_value_rerank_is_deterministic_and_respects_budget():
+    gradient = torch.tensor([5.0, 5.0, 4.0, 4.0, 3.0])
+    utility = torch.tensor([1.0, 2.0, 5.0, 4.0, 100.0])
+    candidate = torch.ones((5,), dtype=torch.bool)
+
+    first = select_gradient_priority_value_rerank_topk(gradient, utility, candidate, 3, 0.5)
+    second = select_gradient_priority_value_rerank_topk(gradient, utility, candidate, 3, 0.5)
+
+    assert torch.equal(first, second)
+    assert first.numel() == 3
+
+
+def test_value_rerank_protects_core_and_bounds_selected_rank():
+    gradient = torch.tensor([10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0])
+    utility = torch.tensor([0.0, 0.0, 0.1, 0.2, 0.9, 0.8, 100.0, 200.0])
+    candidate = torch.ones((8,), dtype=torch.bool)
+
+    selected = select_gradient_priority_value_rerank_topk(
+        gradient,
+        utility,
+        candidate,
+        budget=4,
+        rerank_fraction=0.5,
+    )
+
+    assert {0, 1}.issubset(set(selected.tolist()))
+    assert max(selected.tolist()) <= 5
 
 
 def test_invalid_quantile_and_masks_raise_value_error():

@@ -130,6 +130,108 @@ def compute_refine_utility(observation_scarcity, structural_value, redundancy,
         return torch.nan_to_num(utility, nan=0.0, posinf=0.0, neginf=0.0)
 
 
+def compute_demand_weighted_value_score(gradient_score, utility, candidate_mask=None):
+    """Compute demand-weighted allocation score A_i = g_i * U_i.
+
+    This reuses the same gradient demand score used by gradient gating and does
+    not normalize, soften, or otherwise transform either input.
+    """
+    with torch.no_grad():
+        _validate_same_shape(gradient_score, utility)
+        device = gradient_score.device
+        gradient = gradient_score.to(dtype=torch.float32)
+        value = utility.to(device=device, dtype=torch.float32)
+        valid = torch.isfinite(gradient) & torch.isfinite(value)
+        if candidate_mask is not None:
+            if not torch.is_tensor(candidate_mask) or candidate_mask.shape != gradient_score.shape:
+                raise ValueError("candidate_mask must be a BoolTensor[N] matching gradient_score.")
+            valid = valid & candidate_mask.to(device=device, dtype=torch.bool)
+
+        allocation_score = torch.zeros_like(gradient, dtype=torch.float32)
+        allocation_score[valid] = gradient[valid] * value[valid]
+        return torch.nan_to_num(allocation_score, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def select_gradient_priority_value_rerank_topk(
+    gradient_score,
+    utility,
+    candidate_mask,
+    budget,
+    rerank_fraction=0.25,
+    return_mask=False,
+):
+    """Select gradient-priority Top-k with limited Value reranking at the boundary.
+
+    Gradient ranking first protects the highest-gradient core.  Structural
+    utility may only rerank candidates inside the boundary pool:
+        ranks protected_count + 1 through K + rerank_slots.
+    """
+    with torch.no_grad():
+        _validate_same_shape(gradient_score, utility)
+        if candidate_mask is None or not torch.is_tensor(candidate_mask) or candidate_mask.shape != gradient_score.shape:
+            raise ValueError("candidate_mask must be a BoolTensor[N] matching gradient_score.")
+        if budget < 0:
+            raise ValueError("budget must be non-negative.")
+        rerank_fraction = float(rerank_fraction)
+        if not (0.0 <= rerank_fraction <= 0.5):
+            raise ValueError("rerank_fraction must satisfy 0.0 <= rerank_fraction <= 0.5.")
+
+        k = int(budget)
+        device = gradient_score.device
+        if k <= 0:
+            selected_indices = torch.empty((0,), dtype=torch.long, device=device)
+        else:
+            gradient = gradient_score.to(dtype=torch.float32)
+            value = utility.to(device=device, dtype=torch.float32)
+            valid = (
+                candidate_mask.to(device=device, dtype=torch.bool)
+                & torch.isfinite(gradient)
+                & torch.isfinite(value)
+            )
+            eligible_indices = torch.nonzero(valid, as_tuple=False).squeeze(1)
+            eligible_count = int(eligible_indices.numel())
+            if eligible_count <= k:
+                selected_indices = eligible_indices
+            else:
+                eligible_gradient = gradient[eligible_indices]
+                gradient_order = torch.argsort(eligible_gradient, descending=True)
+                ranked_indices = eligible_indices[gradient_order]
+
+                rerank_slots = int(round(k * rerank_fraction))
+                rerank_slots = max(0, min(rerank_slots, k))
+                protected_count = k - rerank_slots
+
+                protected_indices = ranked_indices[:protected_count]
+                if rerank_slots == 0:
+                    selected_indices = protected_indices
+                else:
+                    boundary_end = min(k + rerank_slots, eligible_count)
+                    boundary_indices = ranked_indices[protected_count:boundary_end]
+                    boundary_slots = min(rerank_slots, int(boundary_indices.numel()))
+                    if boundary_slots > 0:
+                        boundary_value = value[boundary_indices]
+                        value_order = torch.argsort(boundary_value, descending=True)
+                        reranked_indices = boundary_indices[value_order[:boundary_slots]]
+                    else:
+                        reranked_indices = torch.empty((0,), dtype=torch.long, device=device)
+                    selected_indices = torch.cat((protected_indices, reranked_indices), dim=0)
+
+                    if selected_indices.numel() < k:
+                        selected_mask = torch.zeros_like(gradient, dtype=torch.bool)
+                        selected_mask[selected_indices] = True
+                        fill_indices = ranked_indices[~selected_mask[ranked_indices]]
+                        selected_indices = torch.cat(
+                            (selected_indices, fill_indices[: k - selected_indices.numel()]),
+                            dim=0,
+                        )
+
+        if return_mask:
+            selected_mask = torch.zeros_like(gradient_score, dtype=torch.bool)
+            selected_mask[selected_indices] = True
+            return selected_mask
+        return selected_indices.to(dtype=torch.long)
+
+
 def build_candidate_pool(
     recent_visible_mask=None,
     high_gradient_mask=None,

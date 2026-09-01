@@ -9,8 +9,11 @@ import torch
 from torch import nn
 
 from utils.budget_densification import (
+    build_gradient_candidate_mask,
     build_official_clone_split_masks,
     compute_gradient_score,
+    select_gradient_gated_demand_value_topk,
+    select_gradient_gated_value_topk,
     select_gradient_topk,
 )
 
@@ -81,6 +84,176 @@ def test_negative_nan_and_inf_gradient_are_not_selected():
     selected = select_gradient_topk(score, budget=6)
 
     assert selected.tolist() == [0, 5]
+
+
+def test_value_candidate_gate_excludes_high_utility_low_gradient():
+    utility = torch.tensor([0.2, 100.0, 0.8, 50.0])
+    gradient = torch.tensor([0.7, 0.1, 0.9, 0.2])
+
+    selected = select_gradient_gated_value_topk(
+        utility,
+        budget=2,
+        gradient_score=gradient,
+        grad_threshold=0.5,
+    )
+
+    assert selected.tolist() == [2, 0]
+
+
+def test_value_candidate_gate_leaves_budget_unused_when_candidates_are_insufficient():
+    utility = torch.tensor([1.0, 2.0, 3.0, 200.0, 100.0])
+    gradient = torch.tensor([0.5, 0.6, 0.7, 0.1, 0.0])
+
+    selected = select_gradient_gated_value_topk(
+        utility,
+        budget=100,
+        gradient_score=gradient,
+        grad_threshold=0.5,
+    )
+
+    assert selected.tolist() == [2, 1, 0]
+
+
+def test_demand_value_continuous_demand_can_change_value_ranking():
+    utility = torch.tensor([10.0, 2.0])
+    gradient = torch.tensor([1.0, 10.0])
+
+    value_selected = select_gradient_gated_value_topk(
+        utility,
+        budget=1,
+        gradient_score=gradient,
+        grad_threshold=0.5,
+    )
+    demand_selected = select_gradient_gated_demand_value_topk(
+        utility,
+        budget=1,
+        gradient_score=gradient,
+        grad_threshold=0.5,
+    )
+
+    assert value_selected.tolist() == [0]
+    assert demand_selected.tolist() == [1]
+
+
+def test_demand_value_preserves_structural_value_ranking_when_gradient_is_close():
+    utility = torch.tensor([10.0, 2.0])
+    gradient = torch.tensor([1.0, 1.2])
+
+    selected = select_gradient_gated_demand_value_topk(
+        utility,
+        budget=1,
+        gradient_score=gradient,
+        grad_threshold=0.5,
+    )
+
+    assert selected.tolist() == [0]
+
+
+def test_demand_value_keeps_gradient_gate():
+    utility = torch.tensor([1.0, 1000.0, 2.0])
+    gradient = torch.tensor([0.8, 0.1, 0.7])
+
+    selected = select_gradient_gated_demand_value_topk(
+        utility,
+        budget=2,
+        gradient_score=gradient,
+        grad_threshold=0.5,
+    )
+
+    assert 1 not in selected.tolist()
+    assert selected.tolist() == [2, 0]
+
+
+def test_demand_value_budget_caps_selected_count():
+    utility = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    gradient = torch.tensor([1.0, 1.0, 1.0, 1.0])
+
+    selected = select_gradient_gated_demand_value_topk(
+        utility,
+        budget=2,
+        gradient_score=gradient,
+        grad_threshold=0.5,
+    )
+
+    assert selected.numel() == 2
+    assert selected.tolist() == [3, 2]
+
+
+def test_demand_value_rejects_non_finite_gradient_or_utility():
+    utility = torch.tensor([1.0, 100.0, float("nan"), float("inf"), 3.0])
+    gradient = torch.tensor([1.0, float("nan"), 2.0, 2.0, float("inf")])
+
+    selected = select_gradient_gated_demand_value_topk(
+        utility,
+        budget=5,
+        gradient_score=gradient,
+        grad_threshold=0.5,
+    )
+
+    assert selected.tolist() == [0]
+
+
+def test_non_finite_gradient_is_not_a_value_candidate():
+    gradient = torch.tensor([0.6, float("nan"), float("inf"), -float("inf"), 0.5])
+
+    candidate = build_gradient_candidate_mask(gradient, grad_threshold=0.5)
+
+    assert torch.equal(candidate, torch.tensor([True, False, False, False, True]))
+
+
+def test_value_allocation_and_value_gestalt_share_gradient_gated_value_path():
+    source = (Path(__file__).resolve().parents[1] / "train.py").read_text(encoding="utf-8")
+    shared_branch = 'elif densification_mode in ("value_allocation", "value_gestalt", "demand_value", "demand_value_gestalt", "value_rerank", "value_rerank_gestalt"):'
+    branch_start = source.index(shared_branch)
+    branch_end = source.index("else:", branch_start)
+    shared_branch_source = source[branch_start:branch_end]
+    helper_start = source.index("def apply_value_allocation_densification(")
+    helper_end = source.index("def training_report(", helper_start)
+    helper_source = source[helper_start:helper_end]
+
+    assert "apply_value_allocation_densification(" in shared_branch_source
+    assert "select_gradient_gated_value_topk(" in helper_source
+    assert "select_gradient_gated_demand_value_topk(" in helper_source
+
+
+def test_official_and_budget_gradient_paths_do_not_use_value_gate():
+    source = (Path(__file__).resolve().parents[1] / "train.py").read_text(encoding="utf-8")
+    official_start = source.index('if densification_mode == "official":')
+    official_end = source.index('elif densification_mode == "budget_gradient":', official_start)
+    official_source = source[official_start:official_end]
+    budget_start = source.index('elif densification_mode == "budget_gradient":', official_end)
+    budget_end = source.index('elif densification_mode in ("value_allocation", "value_gestalt", "demand_value", "demand_value_gestalt", "value_rerank", "value_rerank_gestalt"):', budget_start)
+    budget_source = source[budget_start:budget_end]
+
+    assert "select_gradient_gated_value_topk" not in official_source
+    assert "select_gradient_gated_value_topk" not in budget_source
+    assert "select_gradient_gated_demand_value_topk" not in official_source
+    assert "select_gradient_gated_demand_value_topk" not in budget_source
+
+
+def test_value_rerank_gestalt_reuses_value_rerank_selection_path():
+    source = (Path(__file__).resolve().parents[1] / "train.py").read_text(encoding="utf-8")
+    rerank_branch = 'elif mode in ("value_rerank", "value_rerank_gestalt"):'
+    branch_start = source.index(rerank_branch)
+    branch_end = source.index("else:", branch_start)
+    branch_source = source[branch_start:branch_end]
+
+    assert "select_gradient_priority_value_rerank_topk(" in branch_source
+    assert "compute_value_rerank_diagnostics(" in branch_source
+    assert source.count("select_gradient_priority_value_rerank_topk(") == 1
+
+
+def test_value_rerank_gestalt_enables_existing_gestalt_loss_path():
+    source = (Path(__file__).resolve().parents[1] / "train.py").read_text(encoding="utf-8")
+    gestalt_modes = 'use_gestalt_loss = densification_mode in ("value_gestalt", "demand_value_gestalt", "value_rerank_gestalt")'
+    branch_start = source.index("if use_gestalt_loss and iteration > opt.gestalt_warmup:")
+    branch_end = source.index("loss.backward()", branch_start)
+    branch_source = source[branch_start:branch_end]
+
+    assert gestalt_modes in source
+    assert "compute_plane_continuity_loss(" in branch_source
+    assert "compute_normal_continuity_loss(" in branch_source
+    assert "loss = loss + weighted_gestalt_loss" in branch_source
 
 
 def _training_args(percent_dense=0.1):

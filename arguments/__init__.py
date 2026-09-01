@@ -103,6 +103,7 @@ class OptimizationParams(ParamGroup):
         self.max_gaussians = 500000
         self.candidate_pool_size = 5000
         self.budget_schedule = "fixed"
+        self.value_rerank_fraction = 0.25
         self.value_warmup = 3000
         self.value_interval = 100
         self.knn_k = 12

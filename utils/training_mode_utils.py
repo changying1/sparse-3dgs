@@ -3,7 +3,16 @@
 import math
 
 
-SUPPORTED_DENSIFICATION_MODES = ("official", "budget_gradient", "value_allocation", "value_gestalt")
+SUPPORTED_DENSIFICATION_MODES = (
+    "official",
+    "budget_gradient",
+    "value_allocation",
+    "value_gestalt",
+    "demand_value",
+    "demand_value_gestalt",
+    "value_rerank",
+    "value_rerank_gestalt",
+)
 UNIMPLEMENTED_DENSIFICATION_MODES = {
     "full": "full requires Phase 11.",
 }
@@ -24,14 +33,30 @@ def validate_densification_mode(opt):
     if mode not in SUPPORTED_DENSIFICATION_MODES:
         raise ValueError(f"Unknown densification_mode '{mode}'.")
 
-    if mode not in ("value_allocation", "value_gestalt"):
+    value_modes = (
+        "value_allocation",
+        "value_gestalt",
+        "demand_value",
+        "demand_value_gestalt",
+        "value_rerank",
+        "value_rerank_gestalt",
+    )
+    gestalt_value_modes = ("value_gestalt", "demand_value_gestalt", "value_rerank_gestalt")
+
+    if mode not in value_modes:
         return mode
 
     _validate_value_allocation_parameters(opt, mode)
-    if mode == "value_gestalt":
+    if mode in ("value_rerank", "value_rerank_gestalt"):
+        opt.value_rerank_fraction = _to_float(_require_attr(opt, "value_rerank_fraction"), "value_rerank_fraction")
+        if not math.isfinite(opt.value_rerank_fraction):
+            raise ValueError("value_rerank_fraction must be finite.")
+        if not (0.0 <= opt.value_rerank_fraction <= 0.5):
+            raise ValueError("value_rerank_fraction must satisfy 0.0 <= value_rerank_fraction <= 0.5.")
+    if mode in gestalt_value_modes:
         validate_gestalt_parameters(opt)
         if not opt.enable_gestalt_loss:
-            raise ValueError("value_gestalt requires enable_gestalt_loss=True.")
+            raise ValueError(f"{mode} requires enable_gestalt_loss=True.")
     return mode
 
 
