@@ -12,6 +12,9 @@ SUPPORTED_DENSIFICATION_MODES = (
     "demand_value_gestalt",
     "value_rerank",
     "value_rerank_gestalt",
+    "value_rerank_gestalt_conf",
+    "value_rerank_gestalt_gate",
+    "value_rerank_gestalt_relation_gate",
 )
 UNIMPLEMENTED_DENSIFICATION_MODES = {
     "full": "full requires Phase 11.",
@@ -40,14 +43,24 @@ def validate_densification_mode(opt):
         "demand_value_gestalt",
         "value_rerank",
         "value_rerank_gestalt",
+        "value_rerank_gestalt_conf",
+        "value_rerank_gestalt_gate",
+        "value_rerank_gestalt_relation_gate",
     )
-    gestalt_value_modes = ("value_gestalt", "demand_value_gestalt", "value_rerank_gestalt")
+    gestalt_value_modes = (
+        "value_gestalt",
+        "demand_value_gestalt",
+        "value_rerank_gestalt",
+        "value_rerank_gestalt_conf",
+        "value_rerank_gestalt_gate",
+        "value_rerank_gestalt_relation_gate",
+    )
 
     if mode not in value_modes:
         return mode
 
     _validate_value_allocation_parameters(opt, mode)
-    if mode in ("value_rerank", "value_rerank_gestalt"):
+    if mode in ("value_rerank", "value_rerank_gestalt", "value_rerank_gestalt_conf", "value_rerank_gestalt_gate", "value_rerank_gestalt_relation_gate"):
         opt.value_rerank_fraction = _to_float(_require_attr(opt, "value_rerank_fraction"), "value_rerank_fraction")
         if not math.isfinite(opt.value_rerank_fraction):
             raise ValueError("value_rerank_fraction must be finite.")

@@ -203,8 +203,7 @@ def test_non_finite_gradient_is_not_a_value_candidate():
 
 def test_value_allocation_and_value_gestalt_share_gradient_gated_value_path():
     source = (Path(__file__).resolve().parents[1] / "train.py").read_text(encoding="utf-8")
-    shared_branch = 'elif densification_mode in ("value_allocation", "value_gestalt", "demand_value", "demand_value_gestalt", "value_rerank", "value_rerank_gestalt"):'
-    branch_start = source.index(shared_branch)
+    branch_start = source.index('elif densification_mode in ("value_allocation",')
     branch_end = source.index("else:", branch_start)
     shared_branch_source = source[branch_start:branch_end]
     helper_start = source.index("def apply_value_allocation_densification(")
@@ -212,6 +211,8 @@ def test_value_allocation_and_value_gestalt_share_gradient_gated_value_path():
     helper_source = source[helper_start:helper_end]
 
     assert "apply_value_allocation_densification(" in shared_branch_source
+    assert '"value_rerank_gestalt_gate"' in shared_branch_source
+    assert '"value_rerank_gestalt_relation_gate"' in shared_branch_source
     assert "select_gradient_gated_value_topk(" in helper_source
     assert "select_gradient_gated_demand_value_topk(" in helper_source
 
@@ -222,7 +223,7 @@ def test_official_and_budget_gradient_paths_do_not_use_value_gate():
     official_end = source.index('elif densification_mode == "budget_gradient":', official_start)
     official_source = source[official_start:official_end]
     budget_start = source.index('elif densification_mode == "budget_gradient":', official_end)
-    budget_end = source.index('elif densification_mode in ("value_allocation", "value_gestalt", "demand_value", "demand_value_gestalt", "value_rerank", "value_rerank_gestalt"):', budget_start)
+    budget_end = source.index('elif densification_mode in ("value_allocation",', budget_start)
     budget_source = source[budget_start:budget_end]
 
     assert "select_gradient_gated_value_topk" not in official_source
@@ -233,11 +234,12 @@ def test_official_and_budget_gradient_paths_do_not_use_value_gate():
 
 def test_value_rerank_gestalt_reuses_value_rerank_selection_path():
     source = (Path(__file__).resolve().parents[1] / "train.py").read_text(encoding="utf-8")
-    rerank_branch = 'elif mode in ("value_rerank", "value_rerank_gestalt"):'
-    branch_start = source.index(rerank_branch)
+    branch_start = source.index('elif mode in ("value_rerank",')
     branch_end = source.index("else:", branch_start)
     branch_source = source[branch_start:branch_end]
 
+    assert '"value_rerank_gestalt_gate"' in branch_source
+    assert '"value_rerank_gestalt_relation_gate"' in branch_source
     assert "select_gradient_priority_value_rerank_topk(" in branch_source
     assert "compute_value_rerank_diagnostics(" in branch_source
     assert source.count("select_gradient_priority_value_rerank_topk(") == 1
@@ -245,14 +247,24 @@ def test_value_rerank_gestalt_reuses_value_rerank_selection_path():
 
 def test_value_rerank_gestalt_enables_existing_gestalt_loss_path():
     source = (Path(__file__).resolve().parents[1] / "train.py").read_text(encoding="utf-8")
-    gestalt_modes = 'use_gestalt_loss = densification_mode in ("value_gestalt", "demand_value_gestalt", "value_rerank_gestalt")'
     branch_start = source.index("if use_gestalt_loss and iteration > opt.gestalt_warmup:")
     branch_end = source.index("loss.backward()", branch_start)
     branch_source = source[branch_start:branch_end]
 
-    assert gestalt_modes in source
+    use_gestalt_start = source.index("use_gestalt_loss = densification_mode in (")
+    use_gestalt_end = source.index("use_confidence_gestalt_loss", use_gestalt_start)
+    use_gestalt_source = source[use_gestalt_start:use_gestalt_end]
+
+    assert '"value_rerank_gestalt"' in use_gestalt_source
+    assert '"value_rerank_gestalt_conf"' in use_gestalt_source
+    assert '"value_rerank_gestalt_gate"' in use_gestalt_source
+    assert '"value_rerank_gestalt_relation_gate"' in use_gestalt_source
     assert "compute_plane_continuity_loss(" in branch_source
     assert "compute_normal_continuity_loss(" in branch_source
+    assert "compute_gated_plane_continuity_loss(" in branch_source
+    assert "compute_gated_normal_continuity_loss(" in branch_source
+    assert "compute_common_neighbor_support(" in branch_source
+    assert "compute_surface_relation_reliability(" in branch_source
     assert "loss = loss + weighted_gestalt_loss" in branch_source
 
 

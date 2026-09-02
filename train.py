@@ -28,8 +28,16 @@ from utils.budget_densification import (
 )
 from utils.edge_support import aggregate_multiview_edge_support, compute_edge_map
 from utils.gestalt_loss import (
+    compute_common_neighbor_support,
+    compute_edge_reliability,
+    compute_gated_normal_continuity_loss,
+    compute_gated_plane_continuity_loss,
+    compute_normal_reliability,
     compute_normal_continuity_loss,
     compute_plane_continuity_loss,
+    compute_surface_relation_reliability,
+    compute_weighted_normal_continuity_loss,
+    compute_weighted_plane_continuity_loss,
     select_same_surface_edges,
     subsample_edges,
 )
@@ -96,8 +104,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         "demand_value_gestalt",
         "value_rerank",
         "value_rerank_gestalt",
+        "value_rerank_gestalt_conf",
+        "value_rerank_gestalt_gate",
+        "value_rerank_gestalt_relation_gate",
     )
-    use_gestalt_loss = densification_mode in ("value_gestalt", "demand_value_gestalt", "value_rerank_gestalt")
+    use_gestalt_loss = densification_mode in (
+        "value_gestalt",
+        "demand_value_gestalt",
+        "value_rerank_gestalt",
+        "value_rerank_gestalt_conf",
+        "value_rerank_gestalt_gate",
+        "value_rerank_gestalt_relation_gate",
+    )
+    use_confidence_gestalt_loss = densification_mode == "value_rerank_gestalt_conf"
+    use_gated_gestalt_loss = densification_mode == "value_rerank_gestalt_gate"
+    use_relation_gated_gestalt_loss = densification_mode == "value_rerank_gestalt_relation_gate"
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -231,8 +252,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 max_distance=None,
             )
             edges = subsample_edges(edges, opt.gestalt_edge_sample_num)
-            plane_loss = compute_plane_continuity_loss(gaussians.get_xyz, normals, edges)
-            normal_loss = compute_normal_continuity_loss(normals, edges)
+            confidence_stats = None
+            if use_confidence_gestalt_loss or use_gated_gestalt_loss or use_relation_gated_gestalt_loss:
+                point_confidence = compute_normal_reliability(gaussians.get_scaling)
+                normal_edge_confidence = compute_edge_reliability(point_confidence, edges)
+                edge_confidence = normal_edge_confidence
+                relation_confidence = None
+                if use_relation_gated_gestalt_loss:
+                    relation_confidence = compute_common_neighbor_support(gestalt_neighbor_indices, edges)
+                    edge_confidence = compute_surface_relation_reliability(normal_edge_confidence, relation_confidence)
+                    plane_loss = compute_gated_plane_continuity_loss(gaussians.get_xyz, normals, edges, edge_confidence)
+                    normal_loss = compute_gated_normal_continuity_loss(normals, edges, edge_confidence)
+                elif use_gated_gestalt_loss:
+                    plane_loss = compute_gated_plane_continuity_loss(gaussians.get_xyz, normals, edges, edge_confidence)
+                    normal_loss = compute_gated_normal_continuity_loss(normals, edges, edge_confidence)
+                else:
+                    plane_loss = compute_weighted_plane_continuity_loss(gaussians.get_xyz, normals, edges, edge_confidence)
+                    normal_loss = compute_weighted_normal_continuity_loss(normals, edges, edge_confidence)
+                confidence_stats = build_gestalt_confidence_stats(point_confidence, normal_edge_confidence)
+                if use_relation_gated_gestalt_loss:
+                    confidence_stats.update(build_gestalt_relation_stats(relation_confidence, edge_confidence))
+                    confidence_stats["gestalt_weighting_mode"] = "relation_gated"
+                else:
+                    confidence_stats["gestalt_weighting_mode"] = "gated" if use_gated_gestalt_loss else "normalized"
+            else:
+                plane_loss = compute_plane_continuity_loss(gaussians.get_xyz, normals, edges)
+                normal_loss = compute_normal_continuity_loss(normals, edges)
             gestalt_loss = plane_loss + float(opt.lambda_normal) * normal_loss
             weighted_gestalt_loss = float(opt.lambda_gestalt) * gestalt_loss
             loss = loss + weighted_gestalt_loss
@@ -247,6 +292,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 "gestalt_graph_build_time": gestalt_graph_build_time,
                 "gestalt_loss_time": gestalt_loss_time,
             }
+            if confidence_stats is not None:
+                gestalt_stats.update(confidence_stats)
 
         loss.backward()
 
@@ -274,8 +321,34 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     tb_writer.add_scalar("gestalt/weighted_loss", gestalt_stats["weighted_gestalt_loss"].item(), iteration)
                     tb_writer.add_scalar("gestalt/graph_build_time", gestalt_stats["gestalt_graph_build_time"], iteration)
                     tb_writer.add_scalar("gestalt/loss_time", gestalt_stats["gestalt_loss_time"], iteration)
+                    if "confidence_mean" in gestalt_stats:
+                        tb_writer.add_scalar("gestalt_confidence/point_mean", gestalt_stats["confidence_mean"], iteration)
+                        tb_writer.add_scalar("gestalt_confidence/point_median", gestalt_stats["confidence_median"], iteration)
+                        tb_writer.add_scalar("gestalt_confidence/point_q10", gestalt_stats["confidence_q10"], iteration)
+                        tb_writer.add_scalar("gestalt_confidence/point_q90", gestalt_stats["confidence_q90"], iteration)
+                        tb_writer.add_scalar("gestalt_confidence/edge_mean", gestalt_stats["edge_confidence_mean"], iteration)
+                        tb_writer.add_scalar("gestalt_confidence/edge_median", gestalt_stats["edge_confidence_median"], iteration)
+                        tb_writer.add_scalar("gestalt_confidence/edge_q10", gestalt_stats["edge_confidence_q10"], iteration)
+                        tb_writer.add_scalar("gestalt_confidence/edge_q90", gestalt_stats["edge_confidence_q90"], iteration)
+                        tb_writer.add_scalar("gestalt_confidence/effective_edge_mass", gestalt_stats["effective_edge_mass"], iteration)
+                        tb_writer.add_scalar("gestalt_confidence/effective_strength_ratio", gestalt_stats["effective_strength_ratio"], iteration)
+                    if "relation_conf_mean" in gestalt_stats:
+                        tb_writer.add_scalar("gestalt_relation/relation_mean", gestalt_stats["relation_conf_mean"], iteration)
+                        tb_writer.add_scalar("gestalt_relation/relation_min", gestalt_stats["relation_conf_min"], iteration)
+                        tb_writer.add_scalar("gestalt_relation/relation_max", gestalt_stats["relation_conf_max"], iteration)
+                        tb_writer.add_scalar("gestalt_relation/relation_q25", gestalt_stats["relation_conf_q25"], iteration)
+                        tb_writer.add_scalar("gestalt_relation/relation_q50", gestalt_stats["relation_conf_q50"], iteration)
+                        tb_writer.add_scalar("gestalt_relation/relation_q75", gestalt_stats["relation_conf_q75"], iteration)
+                        tb_writer.add_scalar("gestalt_relation/final_gate_mean", gestalt_stats["final_gate_mean"], iteration)
+                        tb_writer.add_scalar("gestalt_relation/final_gate_min", gestalt_stats["final_gate_min"], iteration)
+                        tb_writer.add_scalar("gestalt_relation/final_gate_max", gestalt_stats["final_gate_max"], iteration)
+                        tb_writer.add_scalar("gestalt_relation/zero_or_nearzero_gate_ratio", gestalt_stats["zero_or_nearzero_gate_ratio"], iteration)
                 if iteration % opt.structural_log_interval == 0:
                     print_gestalt_log(iteration, gestalt_stats)
+                    if "confidence_mean" in gestalt_stats:
+                        print_gestalt_confidence_log(iteration, gestalt_stats)
+                    if "relation_conf_mean" in gestalt_stats:
+                        print_gestalt_relation_log(iteration, gestalt_stats)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -292,7 +365,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
                     elif densification_mode == "budget_gradient":
                         apply_budget_gradient_densification(gaussians, opt, scene.cameras_extent, size_threshold, radii, iteration)
-                    elif densification_mode in ("value_allocation", "value_gestalt", "demand_value", "demand_value_gestalt", "value_rerank", "value_rerank_gestalt"):
+                    elif densification_mode in ("value_allocation", "value_gestalt", "demand_value", "demand_value_gestalt", "value_rerank", "value_rerank_gestalt", "value_rerank_gestalt_conf", "value_rerank_gestalt_gate", "value_rerank_gestalt_relation_gate"):
                         apply_value_allocation_densification(
                             gaussians,
                             opt,
@@ -331,6 +404,78 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
     print_visibility_statistics(gaussians)
+
+def build_gestalt_confidence_stats(point_confidence, edge_confidence):
+    point_stats = _detached_tensor_stats(point_confidence)
+    edge_stats = _detached_tensor_stats(edge_confidence)
+    edge_count = int(edge_confidence.numel())
+    effective_edge_mass = float(edge_confidence.detach().sum().item()) if edge_count else 0.0
+    return {
+        "confidence_mean": point_stats["mean"],
+        "confidence_median": point_stats["median"],
+        "confidence_q10": point_stats["q10"],
+        "confidence_q90": point_stats["q90"],
+        "edge_confidence_mean": edge_stats["mean"],
+        "edge_confidence_median": edge_stats["median"],
+        "edge_confidence_q10": edge_stats["q10"],
+        "edge_confidence_q90": edge_stats["q90"],
+        "edge_conf_mean": edge_stats["mean"],
+        "edge_conf_median": edge_stats["median"],
+        "edge_conf_q10": edge_stats["q10"],
+        "edge_conf_q90": edge_stats["q90"],
+        "effective_edge_mass": effective_edge_mass,
+        "effective_strength_ratio": effective_edge_mass / edge_count if edge_count else 0.0,
+    }
+
+
+def build_gestalt_relation_stats(relation_confidence, final_gate):
+    relation_stats = _detached_tensor_extended_stats(relation_confidence)
+    gate_stats = _detached_tensor_extended_stats(final_gate)
+    gate = final_gate.detach().float()
+    return {
+        "relation_conf_mean": relation_stats["mean"],
+        "relation_conf_min": relation_stats["min"],
+        "relation_conf_max": relation_stats["max"],
+        "relation_conf_q25": relation_stats["q25"],
+        "relation_conf_q50": relation_stats["q50"],
+        "relation_conf_q75": relation_stats["q75"],
+        "final_gate_mean": gate_stats["mean"],
+        "final_gate_min": gate_stats["min"],
+        "final_gate_max": gate_stats["max"],
+        "final_gate_q25": gate_stats["q25"],
+        "final_gate_q50": gate_stats["q50"],
+        "final_gate_q75": gate_stats["q75"],
+        "zero_or_nearzero_gate_ratio": float((gate <= 1e-8).float().mean().item()) if gate.numel() else 0.0,
+    }
+
+
+def _detached_tensor_stats(values):
+    detached = values.detach()
+    if detached.numel() == 0:
+        return {"mean": 0.0, "median": 0.0, "q10": 0.0, "q90": 0.0}
+    detached = torch.nan_to_num(detached.float(), nan=0.0, posinf=1.0, neginf=0.0)
+    return {
+        "mean": float(detached.mean().item()),
+        "median": float(detached.quantile(0.5).item()),
+        "q10": float(detached.quantile(0.1).item()),
+        "q90": float(detached.quantile(0.9).item()),
+    }
+
+
+def _detached_tensor_extended_stats(values):
+    detached = values.detach()
+    if detached.numel() == 0:
+        return {"mean": 0.0, "min": 0.0, "max": 0.0, "q25": 0.0, "q50": 0.0, "q75": 0.0}
+    detached = torch.nan_to_num(detached.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+    return {
+        "mean": float(detached.mean().item()),
+        "min": float(detached.min().item()),
+        "max": float(detached.max().item()),
+        "q25": float(detached.quantile(0.25).item()),
+        "q50": float(detached.quantile(0.5).item()),
+        "q75": float(detached.quantile(0.75).item()),
+    }
+
 
 def initialize_value_edge_maps(train_cameras):
     edge_maps = []
@@ -440,7 +585,7 @@ def apply_value_allocation_densification(
             opt.densify_grad_threshold,
             return_mask=True,
         )
-    elif mode in ("value_rerank", "value_rerank_gestalt"):
+    elif mode in ("value_rerank", "value_rerank_gestalt", "value_rerank_gestalt_conf", "value_rerank_gestalt_gate", "value_rerank_gestalt_relation_gate"):
         gradient_candidate_mask = build_gradient_candidate_mask(gradient_score, opt.densify_grad_threshold)
         selected_mask = select_gradient_priority_value_rerank_topk(
             gradient_score,
@@ -577,6 +722,49 @@ def print_gestalt_log(iteration, stats):
         f"gestalt_loss_time={stats['gestalt_loss_time']:.4f}s"
     )
     print(message)
+
+
+def print_gestalt_confidence_log(iteration, stats):
+    message = (
+        f"\n[GestaltConfidence ITER {iteration}] "
+        f"gestalt_weighting_mode={stats.get('gestalt_weighting_mode', 'normalized')} "
+        f"point_conf_mean={stats['confidence_mean']:.6f} "
+        f"point_conf_median={stats['confidence_median']:.6f} "
+        f"point_conf_q10={stats['confidence_q10']:.6f} "
+        f"point_conf_q90={stats['confidence_q90']:.6f} "
+        f"edge_conf_mean={stats['edge_confidence_mean']:.6f} "
+        f"edge_conf_median={stats['edge_confidence_median']:.6f} "
+        f"edge_conf_q10={stats['edge_confidence_q10']:.6f} "
+        f"edge_conf_q90={stats['edge_confidence_q90']:.6f} "
+        f"effective_edge_mass={stats['effective_edge_mass']:.6f} "
+        f"effective_strength_ratio={stats['effective_strength_ratio']:.6f} "
+        f"edge_count={stats['edge_count']}"
+    )
+    print(message)
+
+
+def print_gestalt_relation_log(iteration, stats):
+    message = (
+        f"\n[GestaltRelationDiag ITER {iteration}] "
+        f"edge_count={stats['edge_count']} "
+        f"normal_conf_mean={stats['edge_confidence_mean']:.6f} "
+        f"relation_conf_mean={stats['relation_conf_mean']:.6f} "
+        f"relation_conf_min={stats['relation_conf_min']:.6f} "
+        f"relation_conf_max={stats['relation_conf_max']:.6f} "
+        f"relation_conf_q25={stats['relation_conf_q25']:.6f} "
+        f"relation_conf_q50={stats['relation_conf_q50']:.6f} "
+        f"relation_conf_q75={stats['relation_conf_q75']:.6f} "
+        f"final_gate_mean={stats['final_gate_mean']:.6f} "
+        f"final_gate_min={stats['final_gate_min']:.6f} "
+        f"final_gate_max={stats['final_gate_max']:.6f} "
+        f"zero_or_nearzero_gate_ratio={stats['zero_or_nearzero_gate_ratio']:.6f} "
+        f"plane_loss={stats['plane_loss'].item():.6f} "
+        f"normal_loss={stats['normal_loss'].item():.6f} "
+        f"gestalt_loss={stats['gestalt_loss'].item():.6f} "
+        f"weighted_gestalt_loss={stats['weighted_gestalt_loss'].item():.6f}"
+    )
+    print(message)
+
 
 def print_densification_log(
     mode,

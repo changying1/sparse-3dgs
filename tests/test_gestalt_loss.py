@@ -4,9 +4,17 @@ import pytest
 import torch
 
 from utils.gestalt_loss import (
+    compute_common_neighbor_support,
+    compute_edge_reliability,
     compute_gestalt_loss,
+    compute_gated_normal_continuity_loss,
+    compute_gated_plane_continuity_loss,
+    compute_normal_reliability,
     compute_normal_continuity_loss,
     compute_plane_continuity_loss,
+    compute_surface_relation_reliability,
+    compute_weighted_normal_continuity_loss,
+    compute_weighted_plane_continuity_loss,
     select_same_surface_edges,
     subsample_edges,
 )
@@ -286,3 +294,406 @@ def test_extreme_small_scale_numerical_stability():
     assert torch.isfinite(result["normal_loss"])
     assert torch.isfinite(xyz.grad).all()
     assert torch.isfinite(rotations.grad).all()
+
+
+def test_normal_reliability_uses_min_mid_scale_ratio_and_detaches():
+    scales = torch.tensor(
+        [
+            [0.01, 0.10, 0.12],
+            [0.10, 0.11, 0.12],
+            [0.20, 0.01, 0.02],
+        ],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+
+    confidence = compute_normal_reliability(scales)
+
+    assert torch.allclose(confidence, torch.tensor([0.9, 1.0 - 0.10 / 0.11, 0.5]), atol=1e-5)
+    assert torch.isfinite(confidence).all()
+    assert torch.all((confidence >= 0.0) & (confidence <= 1.0))
+    assert not confidence.requires_grad
+
+
+def test_normal_reliability_is_invariant_to_axis_order():
+    confidence_a = compute_normal_reliability(torch.tensor([[0.01, 0.10, 0.12]], dtype=torch.float32))
+    confidence_b = compute_normal_reliability(torch.tensor([[0.12, 0.01, 0.10]], dtype=torch.float32))
+
+    assert torch.allclose(confidence_a, confidence_b)
+
+
+def test_normal_reliability_rejects_non_finite_scales():
+    scales = torch.tensor([[0.01, float("nan"), 0.12]], dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="finite"):
+        compute_normal_reliability(scales)
+
+
+def test_edge_reliability_uses_min_endpoint_confidence_and_detaches():
+    point_confidence = torch.tensor([0.9, 0.2, 0.6], dtype=torch.float32, requires_grad=True)
+    edges = torch.tensor([[0, 1], [0, 2]], dtype=torch.long)
+
+    edge_confidence = compute_edge_reliability(point_confidence, edges)
+
+    assert torch.allclose(edge_confidence, torch.tensor([0.2, 0.6]))
+    assert torch.isfinite(edge_confidence).all()
+    assert not edge_confidence.requires_grad
+
+
+def test_edge_reliability_handles_empty_edges():
+    point_confidence = torch.tensor([0.9, 0.2], dtype=torch.float32)
+    edges = torch.empty((0, 2), dtype=torch.long)
+
+    edge_confidence = compute_edge_reliability(point_confidence, edges)
+
+    assert edge_confidence.shape == (0,)
+    assert edge_confidence.dtype == point_confidence.dtype
+    assert edge_confidence.device == point_confidence.device
+
+
+def test_weighted_plane_loss_matches_unweighted_when_all_weights_are_one():
+    xyz = torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.5], [0.0, 1.0, -0.25]], dtype=torch.float32)
+    normals = _z_normals(3)
+    edges = torch.tensor([[0, 1], [0, 2]], dtype=torch.long)
+    weights = torch.ones((2,), dtype=torch.float32)
+
+    unweighted = compute_plane_continuity_loss(xyz, normals, edges)
+    weighted = compute_weighted_plane_continuity_loss(xyz, normals, edges, weights)
+
+    assert torch.allclose(weighted, unweighted, atol=1e-6)
+
+
+def test_weighted_plane_loss_ignores_zero_weight_edges_and_preserves_xyz_gradients():
+    xyz = torch.tensor(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 1.0], [1.0, 0.0, 0.0]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    normals = _z_normals(3)
+    edges = torch.tensor([[0, 1], [0, 2]], dtype=torch.long)
+    weights = torch.tensor([1.0, 0.0], dtype=torch.float32, requires_grad=True)
+
+    loss = compute_weighted_plane_continuity_loss(xyz, normals, edges, weights)
+    loss.backward()
+
+    assert loss.item() > 0.0
+    assert xyz.grad is not None
+    assert torch.isfinite(xyz.grad).all()
+    assert weights.grad is None
+    assert compute_weighted_plane_continuity_loss(xyz.detach(), normals, edges, torch.zeros(2)).item() == 0.0
+    assert compute_weighted_plane_continuity_loss(xyz.detach(), normals, torch.empty((0, 2), dtype=torch.long), torch.empty(0)).item() == 0.0
+
+
+def test_gated_plane_loss_scales_absolute_strength_with_uniform_weights():
+    xyz = torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.5], [0.0, 1.0, -0.25]], dtype=torch.float32)
+    normals = _z_normals(3)
+    edges = torch.tensor([[0, 1], [0, 2]], dtype=torch.long)
+    unweighted = compute_plane_continuity_loss(xyz, normals, edges)
+
+    all_one = compute_gated_plane_continuity_loss(xyz, normals, edges, torch.ones(2))
+    half = compute_gated_plane_continuity_loss(xyz, normals, edges, torch.full((2,), 0.5))
+    zero = compute_gated_plane_continuity_loss(xyz, normals, edges, torch.zeros(2))
+
+    assert torch.allclose(all_one, unweighted, atol=1e-6)
+    assert torch.allclose(half, 0.5 * unweighted, atol=1e-6)
+    assert zero.item() == 0.0
+
+
+def test_gated_plane_loss_zero_weight_edge_contributes_nothing_and_detaches_weights():
+    xyz = torch.tensor(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 1.0], [1.0, 0.0, 0.0]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    normals = _z_normals(3)
+    edges = torch.tensor([[0, 1], [0, 2]], dtype=torch.long)
+    weights = torch.tensor([1.0, 0.0], dtype=torch.float32, requires_grad=True)
+
+    loss = compute_gated_plane_continuity_loss(xyz, normals, edges, weights)
+    loss.backward()
+
+    assert loss.item() > 0.0
+    assert xyz.grad is not None
+    assert torch.isfinite(xyz.grad).all()
+    assert weights.grad is None
+    assert compute_gated_plane_continuity_loss(xyz.detach(), normals, torch.empty((0, 2), dtype=torch.long), torch.empty(0)).item() == 0.0
+
+
+def test_weighted_normal_loss_matches_unweighted_when_all_weights_are_one():
+    normals = torch.tensor([[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=torch.float32)
+    edges = torch.tensor([[0, 1], [0, 2]], dtype=torch.long)
+    weights = torch.ones((2,), dtype=torch.float32)
+
+    unweighted = compute_normal_continuity_loss(normals, edges)
+    weighted = compute_weighted_normal_continuity_loss(normals, edges, weights)
+
+    assert torch.allclose(weighted, unweighted, atol=1e-6)
+
+
+def test_weighted_normal_loss_ignores_zero_weight_edges_and_preserves_normal_gradients():
+    normals = torch.tensor(
+        [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    edges = torch.tensor([[0, 1], [0, 2]], dtype=torch.long)
+    weights = torch.tensor([1.0, 0.0], dtype=torch.float32, requires_grad=True)
+
+    loss = compute_weighted_normal_continuity_loss(normals, edges, weights)
+    loss.backward()
+
+    assert loss.item() > 0.0
+    assert normals.grad is not None
+    assert torch.isfinite(normals.grad).all()
+    assert weights.grad is None
+    assert compute_weighted_normal_continuity_loss(normals.detach(), edges, torch.zeros(2)).item() == 0.0
+    assert compute_weighted_normal_continuity_loss(normals.detach(), torch.empty((0, 2), dtype=torch.long), torch.empty(0)).item() == 0.0
+
+
+def test_gated_normal_loss_scales_absolute_strength_with_uniform_weights():
+    normals = torch.tensor([[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=torch.float32)
+    edges = torch.tensor([[0, 1], [0, 2]], dtype=torch.long)
+    unweighted = compute_normal_continuity_loss(normals, edges)
+
+    all_one = compute_gated_normal_continuity_loss(normals, edges, torch.ones(2))
+    half = compute_gated_normal_continuity_loss(normals, edges, torch.full((2,), 0.5))
+    zero = compute_gated_normal_continuity_loss(normals, edges, torch.zeros(2))
+
+    assert torch.allclose(all_one, unweighted, atol=1e-6)
+    assert torch.allclose(half, 0.5 * unweighted, atol=1e-6)
+    assert zero.item() == 0.0
+
+
+def test_gated_normal_loss_zero_weight_edge_contributes_nothing_and_preserves_normal_gradients():
+    normals = torch.tensor(
+        [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    edges = torch.tensor([[0, 1], [0, 2]], dtype=torch.long)
+    weights = torch.tensor([1.0, 0.0], dtype=torch.float32, requires_grad=True)
+
+    loss = compute_gated_normal_continuity_loss(normals, edges, weights)
+    loss.backward()
+
+    assert loss.item() > 0.0
+    assert normals.grad is not None
+    assert torch.isfinite(normals.grad).all()
+    assert weights.grad is None
+    assert compute_gated_normal_continuity_loss(normals.detach(), torch.empty((0, 2), dtype=torch.long), torch.empty(0)).item() == 0.0
+
+
+def test_gated_and_normalized_weighted_losses_are_mathematically_distinct():
+    xyz = torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.5], [0.0, 1.0, -0.25]], dtype=torch.float32)
+    normals = _z_normals(3)
+    edges = torch.tensor([[0, 1], [0, 2]], dtype=torch.long)
+    weights = torch.full((2,), 0.5)
+
+    original = compute_plane_continuity_loss(xyz, normals, edges)
+    normalized = compute_weighted_plane_continuity_loss(xyz, normals, edges, weights)
+    gated = compute_gated_plane_continuity_loss(xyz, normals, edges, weights)
+
+    assert torch.allclose(normalized, original, atol=1e-6)
+    assert torch.allclose(gated, 0.5 * original, atol=1e-6)
+
+
+def test_compute_gestalt_loss_default_matches_explicit_unweighted_behavior():
+    xyz = torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.25], [0.0, 1.0, -0.15]], dtype=torch.float32)
+    scales = torch.tensor([[1.0, 1.0, 0.1], [1.0, 1.0, 0.1], [1.0, 1.0, 0.1]], dtype=torch.float32)
+    rotations = torch.tensor(
+        [[0.98, 0.04, 0.10, 0.02], [0.99, -0.02, 0.08, 0.03], [0.97, 0.03, 0.12, -0.01]],
+        dtype=torch.float32,
+    )
+    neighbors = _manual_knn(xyz, k=2)
+
+    implicit = compute_gestalt_loss(xyz, scales, rotations, neighbors, normal_threshold=0.8)
+    explicit = compute_gestalt_loss(xyz, scales, rotations, neighbors, normal_threshold=0.8, use_normal_reliability=False)
+
+    assert torch.allclose(implicit["loss"], explicit["loss"])
+    assert set(implicit.keys()) == {"loss", "plane_loss", "normal_loss", "edge_count"}
+
+
+def test_compute_gestalt_loss_supports_weighting_modes():
+    xyz = torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.25], [0.0, 1.0, -0.15]], dtype=torch.float32)
+    scales = torch.tensor([[1.0, 1.0, 0.1], [0.12, 0.10, 0.01], [0.20, 0.02, 0.01]], dtype=torch.float32)
+    rotations = torch.tensor(
+        [[0.98, 0.04, 0.10, 0.02], [0.99, -0.02, 0.08, 0.03], [0.97, 0.03, 0.12, -0.01]],
+        dtype=torch.float32,
+    )
+    neighbors = _manual_knn(xyz, k=2)
+
+    unweighted = compute_gestalt_loss(xyz, scales, rotations, neighbors, normal_threshold=0.8, weighting_mode="none")
+    normalized = compute_gestalt_loss(xyz, scales, rotations, neighbors, normal_threshold=0.8, weighting_mode="normalized")
+    gated = compute_gestalt_loss(xyz, scales, rotations, neighbors, normal_threshold=0.8, weighting_mode="gated")
+
+    assert "weighting_mode" not in unweighted
+    assert normalized["weighting_mode"] == "normalized"
+    assert gated["weighting_mode"] == "gated"
+    assert normalized["edge_count"] == gated["edge_count"] == unweighted["edge_count"]
+    assert gated["loss"] <= normalized["loss"] + 1e-6
+
+
+def test_compute_gestalt_loss_normal_reliability_returns_finite_diagnostics():
+    xyz = torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.25], [0.0, 1.0, -0.15]], dtype=torch.float32)
+    scales = torch.tensor([[1.0, 1.0, 0.1], [0.12, 0.10, 0.01], [0.20, 0.02, 0.01]], dtype=torch.float32)
+    rotations = torch.tensor(
+        [[0.98, 0.04, 0.10, 0.02], [0.99, -0.02, 0.08, 0.03], [0.97, 0.03, 0.12, -0.01]],
+        dtype=torch.float32,
+    )
+    neighbors = _manual_knn(xyz, k=2)
+
+    result = compute_gestalt_loss(xyz, scales, rotations, neighbors, normal_threshold=0.8, use_normal_reliability=True)
+
+    assert result["edge_count"] > 0
+    for key in (
+        "confidence_mean",
+        "confidence_median",
+        "confidence_q10",
+        "confidence_q90",
+        "edge_confidence_mean",
+        "edge_confidence_median",
+        "edge_confidence_q10",
+        "edge_confidence_q90",
+        "effective_edge_mass",
+    ):
+        assert math.isfinite(result[key])
+
+
+def test_common_neighbor_support_high_overlap_matches_overlap_coefficient():
+    neighbors = torch.tensor(
+        [
+            [2, 3, 4, 5],
+            [2, 3, 4, 6],
+            [0, 1, 3, 4],
+            [0, 1, 2, 4],
+            [0, 1, 2, 3],
+            [0, 2, 3, 4],
+            [1, 2, 3, 4],
+        ],
+        dtype=torch.long,
+    )
+    edges = torch.tensor([[0, 1]], dtype=torch.long)
+
+    support = compute_common_neighbor_support(neighbors, edges)
+
+    assert torch.allclose(support, torch.tensor([0.75]))
+    assert not support.requires_grad
+
+
+def test_common_neighbor_support_low_overlap_is_zero():
+    neighbors = torch.tensor(
+        [
+            [2, 3, 4, 5],
+            [6, 7, 8, 9],
+            [0, 1, 3, 4],
+            [0, 1, 2, 4],
+            [0, 1, 2, 3],
+            [0, 2, 3, 4],
+            [1, 2, 3, 4],
+            [1, 2, 3, 4],
+            [1, 2, 3, 4],
+            [1, 2, 3, 4],
+        ],
+        dtype=torch.long,
+    )
+    edges = torch.tensor([[0, 1]], dtype=torch.long)
+
+    support = compute_common_neighbor_support(neighbors, edges)
+
+    assert torch.equal(support, torch.zeros(1))
+
+
+def test_common_neighbor_support_range_and_finite_for_empty_edges():
+    neighbors = torch.tensor([[1], [0]], dtype=torch.long)
+    edges = torch.empty((0, 2), dtype=torch.long)
+
+    support = compute_common_neighbor_support(neighbors, edges)
+
+    assert support.shape == (0,)
+    assert torch.isfinite(support).all()
+    assert torch.all((support >= 0.0) & (support <= 1.0))
+
+
+def test_surface_relation_reliability_multiplies_normal_and_relation_confidence_and_detaches():
+    normal_confidence = torch.tensor([0.8], dtype=torch.float32, requires_grad=True)
+    relation_confidence = torch.tensor([0.5], dtype=torch.float32, requires_grad=True)
+
+    gate = compute_surface_relation_reliability(normal_confidence, relation_confidence)
+
+    assert torch.allclose(gate, torch.tensor([0.4]))
+    assert torch.isfinite(gate).all()
+    assert not gate.requires_grad
+
+
+def test_surface_relation_reliability_sanitizes_non_finite_relation_confidence():
+    normal_confidence = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32)
+    relation_confidence = torch.tensor([float("nan"), float("inf"), -float("inf")], dtype=torch.float32)
+
+    gate = compute_surface_relation_reliability(normal_confidence, relation_confidence)
+
+    assert torch.isfinite(gate).all()
+    assert torch.all((gate >= 0.0) & (gate <= 1.0))
+    assert torch.equal(gate, torch.tensor([0.0, 1.0, 0.0]))
+
+
+def test_relation_gated_losses_use_true_gating_not_sum_normalization():
+    xyz = torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.5], [0.0, 1.0, -0.25]], dtype=torch.float32)
+    normals = _z_normals(3)
+    edges = torch.tensor([[0, 1], [0, 2]], dtype=torch.long)
+    losses_with_one = compute_gated_plane_continuity_loss(xyz, normals, edges, torch.ones(2))
+    losses_with_tenth = compute_gated_plane_continuity_loss(xyz, normals, edges, torch.full((2,), 0.1))
+
+    assert torch.allclose(losses_with_tenth, losses_with_one * 0.1, atol=1e-6)
+
+
+def test_zero_relation_gate_returns_zero_finite_losses_and_backward_is_safe():
+    xyz = torch.tensor(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 1.0], [1.0, 0.0, 0.0]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    normals = _z_normals(3).requires_grad_()
+    edges = torch.tensor([[0, 1], [0, 2]], dtype=torch.long)
+    weights = torch.zeros(2, dtype=torch.float32)
+
+    plane_loss = compute_gated_plane_continuity_loss(xyz, normals, edges, weights)
+    normal_loss = compute_gated_normal_continuity_loss(normals, edges, weights)
+    total = plane_loss + normal_loss
+    total.backward()
+
+    assert plane_loss.item() == 0.0
+    assert normal_loss.item() == 0.0
+    assert torch.isfinite(total)
+    assert torch.isfinite(xyz.grad).all()
+    assert torch.isfinite(normals.grad).all()
+
+
+def test_compute_gestalt_loss_relation_gated_mode_adds_relation_diagnostics():
+    xyz = torch.tensor(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.25], [0.0, 1.0, -0.15], [1.0, 1.0, 0.05]],
+        dtype=torch.float32,
+    )
+    scales = torch.tensor(
+        [[1.0, 1.0, 0.1], [0.12, 0.10, 0.01], [0.20, 0.02, 0.01], [0.15, 0.03, 0.01]],
+        dtype=torch.float32,
+    )
+    rotations = torch.tensor(
+        [[0.98, 0.04, 0.10, 0.02], [0.99, -0.02, 0.08, 0.03], [0.97, 0.03, 0.12, -0.01], [1.0, 0.0, 0.0, 0.0]],
+        dtype=torch.float32,
+    )
+    neighbors = _manual_knn(xyz, k=3)
+
+    result = compute_gestalt_loss(xyz, scales, rotations, neighbors, normal_threshold=0.8, weighting_mode="relation_gated")
+
+    assert result["weighting_mode"] == "relation_gated"
+    assert result["edge_count"] > 0
+    for key in (
+        "relation_conf_mean",
+        "relation_conf_min",
+        "relation_conf_max",
+        "final_gate_mean",
+        "final_gate_min",
+        "final_gate_max",
+        "zero_or_nearzero_gate_ratio",
+    ):
+        assert math.isfinite(result[key])

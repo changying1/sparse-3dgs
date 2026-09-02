@@ -202,6 +202,90 @@ def test_value_rerank_gestalt_reuses_fraction_validation():
         validate_densification_mode(opt)
 
 
+def test_value_rerank_gestalt_conf_is_supported_with_value_rerank_and_enabled_gestalt_parameters():
+    opt = _valid_value_gestalt_opt(mode="value_rerank_gestalt_conf")
+
+    assert validate_densification_mode(opt) == "value_rerank_gestalt_conf"
+    assert opt.value_rerank_fraction == 0.25
+
+
+def test_value_rerank_gestalt_conf_requires_enabled_gestalt_loss():
+    opt = _valid_value_gestalt_opt(mode="value_rerank_gestalt_conf", enable_gestalt_loss=False)
+
+    with pytest.raises(ValueError, match="enable_gestalt_loss"):
+        validate_densification_mode(opt)
+
+
+def test_value_rerank_gestalt_conf_reuses_value_parameter_validation():
+    opt = _valid_value_gestalt_opt(mode="value_rerank_gestalt_conf", tau_e=0.0)
+
+    with pytest.raises(ValueError, match="tau_e"):
+        validate_densification_mode(opt)
+
+
+def test_value_rerank_gestalt_conf_reuses_fraction_validation():
+    opt = _valid_value_gestalt_opt(mode="value_rerank_gestalt_conf", value_rerank_fraction=0.51)
+
+    with pytest.raises(ValueError, match="value_rerank_fraction"):
+        validate_densification_mode(opt)
+
+
+def test_value_rerank_gestalt_gate_is_supported_with_value_rerank_and_enabled_gestalt_parameters():
+    opt = _valid_value_gestalt_opt(mode="value_rerank_gestalt_gate")
+
+    assert validate_densification_mode(opt) == "value_rerank_gestalt_gate"
+    assert opt.value_rerank_fraction == 0.25
+
+
+def test_value_rerank_gestalt_gate_requires_enabled_gestalt_loss():
+    opt = _valid_value_gestalt_opt(mode="value_rerank_gestalt_gate", enable_gestalt_loss=False)
+
+    with pytest.raises(ValueError, match="enable_gestalt_loss"):
+        validate_densification_mode(opt)
+
+
+def test_value_rerank_gestalt_gate_reuses_value_parameter_validation():
+    opt = _valid_value_gestalt_opt(mode="value_rerank_gestalt_gate", tau_e=0.0)
+
+    with pytest.raises(ValueError, match="tau_e"):
+        validate_densification_mode(opt)
+
+
+def test_value_rerank_gestalt_gate_reuses_fraction_validation():
+    opt = _valid_value_gestalt_opt(mode="value_rerank_gestalt_gate", value_rerank_fraction=0.51)
+
+    with pytest.raises(ValueError, match="value_rerank_fraction"):
+        validate_densification_mode(opt)
+
+
+def test_value_rerank_gestalt_relation_gate_is_supported_with_value_rerank_and_enabled_gestalt_parameters():
+    opt = _valid_value_gestalt_opt(mode="value_rerank_gestalt_relation_gate")
+
+    assert validate_densification_mode(opt) == "value_rerank_gestalt_relation_gate"
+    assert opt.value_rerank_fraction == 0.25
+
+
+def test_value_rerank_gestalt_relation_gate_requires_enabled_gestalt_loss():
+    opt = _valid_value_gestalt_opt(mode="value_rerank_gestalt_relation_gate", enable_gestalt_loss=False)
+
+    with pytest.raises(ValueError, match="enable_gestalt_loss"):
+        validate_densification_mode(opt)
+
+
+def test_value_rerank_gestalt_relation_gate_reuses_value_parameter_validation():
+    opt = _valid_value_gestalt_opt(mode="value_rerank_gestalt_relation_gate", tau_e=0.0)
+
+    with pytest.raises(ValueError, match="tau_e"):
+        validate_densification_mode(opt)
+
+
+def test_value_rerank_gestalt_relation_gate_reuses_fraction_validation():
+    opt = _valid_value_gestalt_opt(mode="value_rerank_gestalt_relation_gate", value_rerank_fraction=0.51)
+
+    with pytest.raises(ValueError, match="value_rerank_fraction"):
+        validate_densification_mode(opt)
+
+
 def test_full_is_not_implemented_yet():
     with pytest.raises(NotImplementedError, match="Phase 11"):
         validate_densification_mode(_opt("full"))
