@@ -1,34 +1,52 @@
-from typing import Any
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from transformers import pipeline
-from PIL import Image
 import os
 import sys
+from contextlib import contextmanager
+from utils.runtime_compat import (
+    cuda_model_session,
+    detached_depth_inference,
+    offload_cuda_model,
+)
 # Ensure ml-depth-pro is on sys.path before importing depth_pro
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "submodules", "ml-depth-pro", "src"))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 import depth_pro
+
+
+def _adapt_depth_pro_transform_for_tensor_input(transform):
+    """Drop only DepthPro's leading PIL/NumPy-only ToTensor transform."""
+    transforms = getattr(transform, "transforms", None)
+    if not transforms or transforms[0].__class__.__name__ != "ToTensor":
+        return transform
+    return type(transform)(transforms[1:])
+
+
 depth_pro_model, depth_pro_transform = depth_pro.create_model_and_transforms(device=torch.device("cuda"))
+depth_pro_transform = _adapt_depth_pro_transform_for_tensor_input(depth_pro_transform)
 depth_pro_model.eval()
 for param in depth_pro_model.parameters():
     param.requires_grad = False
     
 def estimate_depth_pro(tensor, mode='test'):
-    if mode == 'test':
-        with torch.no_grad():
-            transformed_image = depth_pro_transform(tensor)
-            prediction = depth_pro_model.infer(transformed_image)
-            render_depth_pro = prediction["depth"]
-            return render_depth_pro
-    else:
-        transformed_image = depth_pro_transform(tensor)
-        prediction = depth_pro_model.infer(transformed_image)
-        render_depth_pro = prediction["depth"]
-        return render_depth_pro
+    # ``mode`` is retained for compatibility with the original TWINGS callers.
+    # Both paths have always produced a target: the original pseudo path was
+    # detached immediately by torch.tensor(...), so no gradients are required.
+    return detached_depth_inference(depth_pro_model, depth_pro_transform, tensor)
+
+
+def offload_depth_pro():
+    offload_cuda_model(depth_pro_model)
+
+
+@contextmanager
+def depth_pro_on_cuda():
+    """Keep the shared DepthPro instance on CUDA only for the enclosed inference."""
+    with cuda_model_session(depth_pro_model):
+        yield
 
 def apply_colormap(depth_map, cmap_name='jet'):
     # Check input type and shape

@@ -17,3 +17,5 @@ TWINGS-Init/src/opencv/build/
 
 # Local backup submodules folders
 *.local/
+# Local experiment outputs
+/output/

@@ -101,6 +101,15 @@ class OptimizationParams(ParamGroup):
         self.depth_loss = True
         self.depth_weight = 0.03 # for DTU 0.01
         self.depth_pseudo_weight = 0.1
+
+        # Frozen FSGS Innovation 1 (disabled by default).
+        self.enable_i1 = False
+        self.i1_structural_weight = 0.05
+        self.i1_stable_quantile = 0.80
+        self.i1_phase1_start = 1600
+        self.i1_phase2_start = 2000
+        self.i1_end_iter = 5000
+        self.i1_preserve_baseline_densification_stats = True
         
         super().__init__(parser, "Optimization Parameters")
 

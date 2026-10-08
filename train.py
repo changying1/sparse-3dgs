@@ -26,13 +26,19 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
-from utils.depth_utils import estimate_depth_pro
+from utils import depth_utils
+from utils.runtime_compat import detached_tensor_to, should_sample_pseudo
+from utils.i1_evidence_structural_loss import (
+    combine_i1_loss,
+    compute_i1_structural_loss,
+    compute_stable_mask_from_gt_rgb,
+    format_i1_log,
+    resolve_i1_gate_mode,
+    should_preserve_i1_densification_stats,
+)
 from utils.image_utils import normalize_depth
 from torchmetrics.functional.regression import pearson_corrcoef
 import matplotlib.pyplot as plt
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "submodules", "ml-depth-pro", "src"))
-sys.path.insert(0, project_root)
-import depth_pro
 from imageio import imwrite
 import json
 # from guidance.sd_utils import StableDiffusion
@@ -60,6 +66,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
+    depth_utils.offload_depth_pro()
+    print("[Speed Audit] DepthPro moved to CPU after camera depth precomputation.")
     # ---------------- Training Setup ----------------
     gaussians.training_setup(opt)
     if checkpoint:
@@ -78,13 +86,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter += 1
     bg_mask = None
     loss_accum = 0
+    i1_stable_mask_cache = {}
     
-    # Load dept pro model and transform
-    model, transform = depth_pro.create_model_and_transforms(device=torch.device("cuda"))
-    model.eval()
-    for param in model.parameters():
-        param.requires_grad = False
-
     train_start_time = time.time()
     for iteration in range(first_iter, opt.iterations + 1):        
         iter_start.record()
@@ -115,7 +118,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 
         if args.depth_loss:
             rendered_depth = render_pkg["depth"][0]     
-            depth_pro_depth = torch.tensor(viewpoint_cam.depth_image).cuda()
+            depth_pro_depth = detached_tensor_to(viewpoint_cam.depth_image, rendered_depth.device)
             depth_pro_depth = depth_pro_depth.reshape(-1, 1)
             rendered_depth = rendered_depth.reshape(-1, 1)
             depth_loss = (1 - pearson_corrcoef(depth_pro_depth, rendered_depth))
@@ -125,14 +128,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration > args.end_sample_pseudo:
                 args.depth_weight = 0.001
                 
-            if iteration % args.sample_pseudo_interval == 0 and iteration > args.start_sample_pseudo and iteration < args.end_sample_pseudo:
+            if should_sample_pseudo(
+                iteration,
+                args.sample_pseudo_interval,
+                args.start_sample_pseudo,
+                args.end_sample_pseudo,
+            ):
                 if not pseudo_stack:
                     pseudo_stack = scene.getPseudoCameras().copy()
                 pseudo_cam = pseudo_stack.pop(randint(0, len(pseudo_stack) - 1))
 
                 render_pkg_pseudo = render(pseudo_cam, gaussians, pipe, background)
                 rendered_depth_pseudo = render_pkg_pseudo["depth"][0]               
-                depth_pro_depth_pseudo = torch.tensor(estimate_depth_pro(render_pkg_pseudo["render"], mode='train')).cuda()
+                with depth_utils.depth_pro_on_cuda():
+                    depth_pro_depth_pseudo = depth_utils.estimate_depth_pro(
+                        render_pkg_pseudo["render"], mode='train'
+                    )
+                depth_pro_depth_pseudo = detached_tensor_to(
+                    depth_pro_depth_pseudo, rendered_depth_pseudo.device
+                )
                 rendered_depth_pseudo = rendered_depth_pseudo.reshape(-1, 1)
                 depth_pro_depth_pseudo = depth_pro_depth_pseudo.reshape(-1, 1)
                 depth_loss_pseudo = (1 - pearson_corrcoef(rendered_depth_pseudo, depth_pro_depth_pseudo))
@@ -141,6 +155,62 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     loss_scale = min((iteration - args.start_sample_pseudo) / 500., 1)
                     loss += loss_scale * args.depth_pseudo_weight * depth_loss_pseudo
                             
+        baseline_loss = loss
+        i1_gate_mode = resolve_i1_gate_mode(
+            iteration,
+            enabled=getattr(opt, "enable_i1", False),
+            phase1_start=getattr(opt, "i1_phase1_start", 1600),
+            phase2_start=getattr(opt, "i1_phase2_start", 2000),
+            end_iter=getattr(opt, "i1_end_iter", 5000),
+        )
+        i1_active = i1_gate_mode is not None and viewpoint_cam.depth_image is not None
+        i1_structural_loss = None
+        if i1_active:
+            camera_id = viewpoint_cam.uid
+            if camera_id not in i1_stable_mask_cache:
+                stable_mask, _, _ = compute_stable_mask_from_gt_rgb(
+                    gt_image.detach(),
+                    stable_quantile=getattr(opt, "i1_stable_quantile", 0.80),
+                )
+                i1_stable_mask_cache[camera_id] = stable_mask.detach()
+            i1_structural_loss, i1_stats, _ = compute_i1_structural_loss(
+                render_pkg["depth"][0],
+                viewpoint_cam.depth_image,
+                stable_mask=i1_stable_mask_cache[camera_id].to(render_pkg["depth"].device),
+                gate_mode=i1_gate_mode,
+            )
+            if iteration % 100 == 0:
+                print(
+                    format_i1_log(
+                        iteration,
+                        camera_id,
+                        i1_stats,
+                        getattr(opt, "i1_structural_weight", 0.05),
+                    ),
+                    flush=True,
+                )
+        loss = combine_i1_loss(
+            baseline_loss,
+            i1_structural_loss,
+            getattr(opt, "i1_structural_weight", 0.05),
+            i1_gate_mode if i1_active else None,
+        )
+        preserve_i1_densification_stats = should_preserve_i1_densification_stats(
+            getattr(opt, "i1_preserve_baseline_densification_stats", True),
+            i1_gate_mode if i1_active else None,
+            iteration,
+            opt.densify_until_iter,
+        )
+        baseline_viewspace_grad = None
+        if preserve_i1_densification_stats:
+            baseline_viewspace_grad = torch.autograd.grad(
+                baseline_loss,
+                viewspace_point_tensor,
+                retain_graph=True,
+                allow_unused=False,
+            )[0].detach()
+            viewspace_point_tensor.grad = None
+
         loss.backward()
         iter_end.record()
                             
@@ -168,8 +238,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scene,
                 render,
                 (pipe, background),
-                model,
-                transform,
             )
             if tb_writer:
                 torch.cuda.synchronize()
@@ -182,7 +250,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Densification
             if iteration < opt.densify_until_iter:
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                gaussians.add_densification_stats(
+                    viewspace_point_tensor,
+                    visibility_filter,
+                    grad_override=(
+                        baseline_viewspace_grad
+                        if preserve_i1_densification_stats
+                        else None
+                    ),
+                )
                         
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = None
@@ -223,7 +299,7 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(args, tb_writer, iteration, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, depth_pro_model, depth_pro_transform):
+def training_report(args, tb_writer, iteration, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
     if tb_writer:
         # tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -235,47 +311,44 @@ def training_report(args, tb_writer, iteration, loss, l1_loss, elapsed, testing_
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(len(scene.getTrainCameras()))]})
 
-        for config in validation_configs:
-            if config['cameras'] and len(config['cameras']) > 0:
-                l1_test = 0.0
-                psnr_test = 0.0
-                for idx, viewpoint in enumerate(config['cameras']):
-                    render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
-                    image = render_pkg["render"]
-                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    rendered_depth = render_pkg["depth"]
-                    
-                    # render_image -> estimated_depth
-                    transformed_image = depth_pro_transform(image)
-                    prediction = depth_pro_model.infer(transformed_image)
-                    render_depth_pro = prediction["depth"]
-                    
-                    # normalize depth
-                    rendered_depth = normalize_depth(rendered_depth)
-                    render_depth_pro = normalize_depth(render_depth_pro)[None]    
-                    
-                    if tb_writer and (idx < 5): # default 5 plot
-                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                        tb_writer.add_images(config['name'] + "_view_{}/render_depth".format(viewpoint.image_name), rendered_depth[None], global_step=iteration)
-                        tb_writer.add_images(config['name'] + "_view_{}/render_depth_pro".format(viewpoint.image_name), render_depth_pro[None], global_step=iteration)
-                        
-                        if iteration == testing_iterations[0]:
-                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)      
-                            transformed_gt_image = depth_pro_transform(gt_image)
-                            prediction = depth_pro_model.infer(transformed_gt_image)
-                            gt_depth_pro = prediction["depth"]
-                            gt_depth_pro = normalize_depth(gt_depth_pro)[None]  
-                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth_depth_pro".format(viewpoint.image_name), gt_depth_pro[None], global_step=iteration)           
-                            
-                    l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
-                                
-                psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
-                if tb_writer:
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+        with depth_utils.depth_pro_on_cuda():
+            for config in validation_configs:
+                if config['cameras'] and len(config['cameras']) > 0:
+                    l1_test = 0.0
+                    psnr_test = 0.0
+                    for idx, viewpoint in enumerate(config['cameras']):
+                        render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
+                        image = render_pkg["render"]
+                        gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                        rendered_depth = render_pkg["depth"]
+
+                        # render_image -> estimated_depth
+                        render_depth_pro = depth_utils.estimate_depth_pro(image)
+
+                        # normalize depth
+                        rendered_depth = normalize_depth(rendered_depth)
+                        render_depth_pro = normalize_depth(render_depth_pro)[None]
+
+                        if tb_writer and (idx < 5): # default 5 plot
+                            tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
+                            tb_writer.add_images(config['name'] + "_view_{}/render_depth".format(viewpoint.image_name), rendered_depth[None], global_step=iteration)
+                            tb_writer.add_images(config['name'] + "_view_{}/render_depth_pro".format(viewpoint.image_name), render_depth_pro[None], global_step=iteration)
+
+                            if iteration == testing_iterations[0]:
+                                tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                                gt_depth_pro = depth_utils.estimate_depth_pro(gt_image)
+                                gt_depth_pro = normalize_depth(gt_depth_pro)[None]
+                                tb_writer.add_images(config['name'] + "_view_{}/ground_truth_depth_pro".format(viewpoint.image_name), gt_depth_pro[None], global_step=iteration)
+
+                        l1_test += l1_loss(image, gt_image).mean().double()
+                        psnr_test += psnr(image, gt_image).mean().double()
+
+                    psnr_test /= len(config['cameras'])
+                    l1_test /= len(config['cameras'])
+                    print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                    if tb_writer:
+                        tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
+                        tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)

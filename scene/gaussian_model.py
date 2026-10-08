@@ -20,6 +20,7 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+from utils.runtime_compat import unwrap_first_result
 
 class GaussianModel:
 
@@ -131,7 +132,8 @@ class GaussianModel:
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        dist_result = distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda())
+        dist2 = torch.clamp_min(unwrap_first_result(dist_result), 1e-7)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
@@ -404,7 +406,12 @@ class GaussianModel:
         self.prune_points(prune_mask)
         torch.cuda.empty_cache()
 
-    def add_densification_stats(self, viewspace_point_tensor, update_filter):
-        self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
+    def add_densification_stats(self, viewspace_point_tensor, update_filter, grad_override=None):
+        gradient = viewspace_point_tensor.grad if grad_override is None else grad_override
+        if gradient is None:
+            raise ValueError("viewspace gradient is required for densification statistics")
+        if gradient.shape != viewspace_point_tensor.shape:
+            raise ValueError("densification gradient override shape must match viewspace points")
+        self.xyz_gradient_accum[update_filter] += torch.norm(gradient[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
