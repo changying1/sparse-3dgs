@@ -18,4 +18,4 @@ def lpips(x: torch.Tensor,
     """
     device = x.device
     criterion = LPIPS(net_type, version).to(device)
-    return criterion(x, y)
+    return criterion(x, y).mean().double()

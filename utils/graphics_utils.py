@@ -75,3 +75,51 @@ def fov2focal(fov, pixels):
 
 def focal2fov(focal, pixels):
     return 2*math.atan(pixels/(2*focal))
+
+## from https://github.com/mrharicot/monodepth
+def inverse_warp_images(image, disparity, row_indices, column_indices):
+    r_ind = row_indices
+    c_ind = column_indices
+    # For bilinear interp. between two sets of pixel offsets (since disparities are floats that fall inbetween pixels)
+    x0 = torch.floor(disparity).type(torch.LongTensor).cuda()
+    x1 = x0 + 1
+
+    # Empty list to store warped batch images
+    warped_ims = []
+
+    # How to do this without loops???
+    for b in range(image.size(0)):  # Loop over images in batch
+
+        # Empty list to store warped channels for current image
+        warped_ims_ch = []
+
+        for ch in range(image.size(1)):  # Loop over RGB channels
+
+            # Column indicies for left side of bilinear interpolation
+            c_ind_d_0 = c_ind + x0[b, 0]
+
+            # Mask of invalid indices
+            c_ind_d_0_invalid = (c_ind_d_0 < 0) | (c_ind_d_0 >= image.size(3))
+
+            # Make indices within bounds
+            c_ind_d_0[c_ind_d_0 >= image.size(3)] = image.size(3) - 1
+            c_ind_d_0[c_ind_d_0 < 0] = 0
+
+            # Same as above but for right side of interpolation
+            c_ind_d_1 = c_ind + x1[b, 0]
+            c_ind_d_1_invalid = (c_ind_d_1 < 0) | (c_ind_d_1 >= image.size(3))
+            c_ind_d_1[c_ind_d_1 >= image.size(3)] = image.size(3) - 1
+            c_ind_d_1[c_ind_d_1 < 0] = 0
+
+            # Inverse warp
+            warped_ims_ch.append(((x1[b, 0] - disparity[b, 0]) * image[b, ch, r_ind, c_ind_d_0] + (
+                        disparity[b, 0] - x0[b, 0]) * image[b, ch, r_ind, c_ind_d_1]).unsqueeze(0).unsqueeze(0))
+
+            # Set invalid areas to 0
+            warped_ims_ch[-1][0, 0, c_ind_d_0_invalid] = 0.0
+            warped_ims_ch[-1][0, 0, c_ind_d_1_invalid] = 0.0
+
+        # List to tensor
+        warped_ims.append(torch.cat(warped_ims_ch, 1))
+
+    return torch.cat(warped_ims, 0)

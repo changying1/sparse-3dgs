@@ -13,50 +13,104 @@ from scene.cameras import Camera
 import numpy as np
 from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
+from tqdm import tqdm
 import torch
-from utils.depth_utils import estimate_depth_pro
 
 WARNED = False
 
 def loadCam(args, id, cam_info, resolution_scale):
     orig_w, orig_h = cam_info.image.size
-    resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
+
+    if args.resolution in [1, 2, 4, 8]:
+        resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
+    else:  # should be a type that converts to float
+        if args.resolution == -1:
+            if orig_w > 1600:
+                global WARNED
+                if not WARNED:
+                    print("[ INFO ] Encountered quite large input images (>1.6K pixels width), rescaling to 1.6K.\n "
+                        "If this is not desired, please explicitly specify '--resolution/-r' as 1")
+                    WARNED = True
+                global_down = orig_w / 1600
+            else:
+                global_down = 1
+        else:
+            global_down = orig_w / args.resolution
+
+        scale = float(global_down) * float(resolution_scale)
+        resolution = (int(orig_w / scale), int(orig_h / scale))
 
     resized_image_rgb = PILtoTorch(cam_info.image, resolution)
 
     gt_image = resized_image_rgb[:3, ...]
+    loaded_mask = None
 
-    if resized_image_rgb.shape[1] == 4:
+    if resized_image_rgb.shape[0] == 4:
         loaded_mask = resized_image_rgb[3:4, ...]
-
-    if cam_info.mask is not None:
-        loaded_mask = PILtoTorch(cam_info.mask, resolution)
-        if loaded_mask.shape[0] == 4:
-            loaded_mask = loaded_mask[:3]
-    else:
-        loaded_mask = None
         
-    depth = estimate_depth_pro(gt_image.cuda())
-    
-    if cam_info.covisibility_map is not None:
-        loaded_covisibility_map = torch.from_numpy(cam_info.covisibility_map).float().unsqueeze(0).cuda()
-    else: 
-        loaded_covisibility_map = None
+        # print("have mask")
+        print(loaded_mask)
+
+    if args.white_background and loaded_mask is not None:
+        
+        # print(f"white bg: {args.white_background}")
+        
+        bg = torch.tensor([1, 1, 1])
+        gt_image = gt_image * loaded_mask + bg[:, None, None] * (1 - loaded_mask)
 
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, bounds=cam_info.bounds,
-                  image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device, depth_image=depth, covisibility_map=loaded_covisibility_map)
-
+                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
+                  image=gt_image, 
+                  gt_alpha_mask=loaded_mask,
+                #   gt_alpha_mask=None,
+                  image_name=cam_info.image_name, uid=id, data_device=args.data_device)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []
 
-    for id, c in enumerate(cam_infos):
+    for id, c in tqdm(enumerate(cam_infos)):
         camera_list.append(loadCam(args, id, c, resolution_scale))
 
     return camera_list
 
+
+def loadRenderCam(args, id, cam_info, resolution_scale):
+    orig_w, orig_h = cam_info.width, cam_info.height
+
+    if args.resolution in [1, 2, 4, 8]:
+        resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
+    else:  # should be a type that converts to float
+        if args.resolution == -1:
+            if orig_w > 6400:
+                global WARNED
+                if not WARNED:
+                    print("[ INFO ] Encountered quite large input images (>1.6K pixels width), rescaling to 6.4K.\n "
+                        "If this is not desired, please explicitly specify '--resolution/-r' as 1")
+                    WARNED = True
+                global_down = orig_w / 6400
+            else:
+                global_down = 1
+        else:
+            global_down = orig_w / args.resolution
+
+        scale = float(global_down) * float(resolution_scale)
+        resolution = (int(orig_w / scale), int(orig_h / scale))
+
+    cam = Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
+                  FoVx=cam_info.FovX, FoVy=cam_info.FovY,
+                  image=None, gt_alpha_mask=None,
+                  image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+    cam.image_width, cam.image_height = resolution
+    return cam
+
+
+def renderCameraList_from_camInfos(cam_infos, resolution_scale, args):
+    camera_list = []
+
+    for id, c in tqdm(enumerate(cam_infos)):
+        camera_list.append(loadRenderCam(args, id, c, resolution_scale))
+
+    return camera_list
 
 def camera_to_JSON(id, camera : Camera):
     Rt = np.zeros((4, 4))

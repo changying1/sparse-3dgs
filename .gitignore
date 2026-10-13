@@ -1,21 +1,45 @@
-# Training / experiment outputs
-outputs/
-
-# Model weights (download separately)
-checkpoints/
-*.pt
-
-# Python / IDE
+﻿# Python
 __pycache__/
-*.pyc
-.vscode/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# External OpenCV source/build trees
-TWINGS-Init/src/opencv/
-TWINGS-Init/src/opencv_contrib/
-TWINGS-Init/src/opencv/build/
+# Environments
+.venv/
+venv/
+env/
 
-# Local backup submodules folders
-*.local/
-# Local experiment outputs
-/output/
+# Experiment outputs
+output/
+outputs/
+runs/
+wandb/
+tensorboard/
+
+# Generated 3D points and datasets
+keypoints_to_3d/
+datasets/
+data/
+
+# Model weights and checkpoints
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+*.h5
+
+# Generated depth caches and arrays
+*.npy
+*.npz
+
+# Logs and local backups
+*.log
+*.bak
+*.bak_*
+*.tmp
+
+# Windows
+Thumbs.db
+Desktop.ini

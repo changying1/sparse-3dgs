@@ -13,8 +13,11 @@ import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
+import torch.nn as nn
 
-def l1_loss(network_output, gt):
+def l1_loss(network_output, gt, mask=None):
+    if mask is not None:
+        return torch.abs((network_output*mask - gt*mask)).mean()
     return torch.abs((network_output - gt)).mean()
 
 def l2_loss(network_output, gt):
@@ -62,3 +65,27 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
     else:
         return ssim_map.mean(1).mean(1).mean(1)
 
+class SmoothLoss(nn.Module):
+    def __init__(self):
+        super(SmoothLoss, self).__init__()
+        self.edge_conv_x_3 = torch.nn.Conv2d(3, 1, 3, bias=False).cuda()
+        self.edge_conv_y_3 = torch.nn.Conv2d(3, 1, 3, bias=False).cuda()
+        self.edge_conv_x_1 = torch.nn.Conv2d(1, 1, 3, bias=False).cuda()
+        self.edge_conv_y_1 = torch.nn.Conv2d(1, 1, 3, bias=False).cuda()
+
+        # Set layer weights to be edge filters
+        with torch.no_grad():
+            for layer in [self.edge_conv_x_3, self.edge_conv_x_1]:
+                for ch in range(layer.weight.size(1)):
+                    layer.weight[0, ch] = torch.Tensor([[0, 0, 0], [-0.5, 0, 0.5], [0, 0, 0]]).cuda()
+
+            for layer in [self.edge_conv_y_3, self.edge_conv_y_1]:
+                for ch in range(layer.weight.size(1)):
+                    layer.weight[0, ch] = torch.Tensor([[0, -0.5, 0], [0, 0, 0], [0, 0.5, 0]]).cuda()
+
+    def forward(self, disparity, image):
+        edge_x_im = torch.exp((self.edge_conv_x_3(image).abs() * -0.33))
+        edge_y_im = torch.exp((self.edge_conv_y_3(image).abs() * -0.33))
+        edge_x_d = self.edge_conv_x_1(disparity)
+        edge_y_d = self.edge_conv_y_1(disparity)
+        return ((edge_x_im * edge_x_d)).abs().mean() + ((edge_y_im * edge_y_d)).abs().mean()

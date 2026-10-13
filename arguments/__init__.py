@@ -40,26 +40,23 @@ class ParamGroup:
     def extract(self, args):
         group = GroupParams()
         for arg in vars(args).items():
-            if arg[0] in vars(self) or ("_" + arg[0]) in vars(self):
-                setattr(group, arg[0], arg[1])
+            # if arg[0] in vars(self) or ("_" + arg[0]) in vars(self):
+            setattr(group, arg[0], arg[1])
         return group
 
 class ModelParams(ParamGroup): 
     def __init__(self, parser, sentinel=False):
-        self.sh_degree = 3
+        # self.sh_degree = 3
+        self.sh_degree = 1
         self._source_path = ""
         self._model_path = ""
         self._images = "images"
         self._resolution = -1
         self._white_background = False
+        self._view_manifest = ""
+        # self._white_background = True
         self.data_device = "cuda"
         self.eval = False
-        self.n_views = 3
-        self.rand_pcd = False
-        
-        self.llff_hold = 8
-        self._pcd_path = ""
-        
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -76,41 +73,23 @@ class PipelineParams(ParamGroup):
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
-        self.iterations = 10000
+        self.iterations = 30_000
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
-        self.position_lr_max_steps = 10000
+        self.position_lr_max_steps = 30_000
         self.feature_lr = 0.0025
         self.opacity_lr = 0.05
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
-        self.densification_interval = 100
+        self.densification_interval = 100 # 100
         self.opacity_reset_interval = 3000
-        self.densify_from_iter = 500
-        self.densify_until_iter = 10000
-        self.densify_grad_threshold = 0.0005
+        self.densify_from_iter = 1000 #500
+        self.densify_until_iter = 15_000
+        self.densify_grad_threshold = 0.0002
         self.random_background = False
-
-        self.start_sample_pseudo = 2000
-        self.end_sample_pseudo = 9500
-        self.sample_pseudo_interval = 10
-        
-        self.depth_loss = True
-        self.depth_weight = 0.03 # for DTU 0.01
-        self.depth_pseudo_weight = 0.1
-
-        # Frozen FSGS Innovation 1 (disabled by default).
-        self.enable_i1 = False
-        self.i1_structural_weight = 0.05
-        self.i1_stable_quantile = 0.80
-        self.i1_phase1_start = 1600
-        self.i1_phase2_start = 2000
-        self.i1_end_iter = 5000
-        self.i1_preserve_baseline_densification_stats = True
-        
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

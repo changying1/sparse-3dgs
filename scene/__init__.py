@@ -12,14 +12,13 @@
 import os
 import random
 import json
+import torch
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
-from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
-from utils.pose_utils import generate_random_poses_llff, generate_random_poses_360
-from scene.cameras import PseudoCamera
-
+from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON, renderCameraList_from_camInfos
+from scene.cameras import Camera
 class Scene:
 
     gaussians : GaussianModel
@@ -31,7 +30,6 @@ class Scene:
         self.model_path = args.model_path
         self.loaded_iter = None
         self.gaussians = gaussians
-        self.source_path = args.source_path
 
         if load_iteration:
             if load_iteration == -1:
@@ -42,25 +40,20 @@ class Scene:
 
         self.train_cameras = {}
         self.test_cameras = {}
-        self.pseudo_cameras = {}
-        print(args.source_path)
-            
+
         if os.path.exists(os.path.join(args.source_path, "sparse")):
-            if args.source_path.find('llff') != -1:
-                print("############ load llff ############")
-                scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, args.n_views, args.llff_hold, pcd_path=args.pcd_path)
-            elif args.source_path.find('mipnerf360') != -1:
-                print("############ load mipnerf360 ############")
-                scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, args.n_views, args.llff_hold, pcd_path=args.pcd_path)            
-            elif args.source_path.find('DTU') != -1:
-                print("############ load DTU ############")
-                scene_info = sceneLoadTypeCallbacks["DTU"](args.source_path, args.images, args.eval, args.n_views, rand_pcd=args.rand_pcd, pcd_path=args.pcd_path)
+            scene_info = sceneLoadTypeCallbacks["Colmap"](
+                args.source_path,
+                args.images,
+                args.eval,
+                args.n_views,
+                args.dataset_name,
+                suffix=args.suffix,
+                view_manifest=args.view_manifest,
+            )
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
-            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, args.n_views, args.llff_hold, args.rand_pcd, args.pcd_path)
-        elif args.source_path.find('replica_few') != -1:
-            print("Found replica path, assuming Replica data set!")
-            scene_info = sceneLoadTypeCallbacks["Replica"](args.source_path, args.images, args.eval, args.n_views, args.rand_pcd)
+            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, args.n_views, args.dataset_name)
         else:
             assert False, "Could not recognize scene type!"
 
@@ -83,44 +76,20 @@ class Scene:
             random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
 
         self.cameras_extent = scene_info.nerf_normalization["radius"]
-        print(self.cameras_extent, 'cameras_extent')
 
         for resolution_scale in resolution_scales:
             print("Loading Training Cameras")
             self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args)
             print("Loading Test Cameras")
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
-                        
-            # Generate pseudo cameras / CoR-GS
-            pseudo_cams = []
-            if args.source_path.find('llff') != -1:
-                pseudo_poses = generate_random_poses_llff(self.train_cameras[resolution_scale])
-            elif args.source_path.find('mipnerf360') != -1:
-                pseudo_poses = generate_random_poses_360(self.train_cameras[resolution_scale])
-            elif args.source_path.find('synthetic') != -1:
-                pseudo_poses = generate_random_poses_360(self.train_cameras[resolution_scale])
-            elif args.source_path.find('DTU') != -1:
-                pseudo_poses = generate_random_poses_llff(self.train_cameras[resolution_scale])
-            elif args.source_path.find('KIST') != -1:
-                pseudo_poses = generate_random_poses_llff(self.train_cameras[resolution_scale])
 
-            view = self.train_cameras[resolution_scale][0]
-            self.bounds = view.bounds
-            for pose in pseudo_poses:
-                pseudo_cams.append(PseudoCamera(
-                    R=pose[:3, :3].T, T=pose[:3, 3], FoVx=view.FoVx, FoVy=view.FoVy,
-                    width=view.image_width, height=view.image_height
-                ))
-            self.pseudo_cameras[resolution_scale] = pseudo_cams
-            
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,
                                                            "point_cloud",
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"))
         else:
-            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent) 
-            self.init_point_cloud = scene_info.point_cloud          
+            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
@@ -132,8 +101,91 @@ class Scene:
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
 
-    def getPseudoCameras(self, scale=1.0):
-        if len(self.pseudo_cameras) == 0:
-            return [None]
+    def getShiftedCamera(self, camera, trans_dist=0.1):
+        intrinsic, extrinsic = camera.get_camera_matrix()
+        point = torch.tensor([trans_dist, 0.0, 0.0, 1.0], device="cuda")
+        point_world = torch.inverse(extrinsic) @ point
+        point_world = point_world[:3]
+        camera_center_trans = (point_world - camera.camera_center).cpu().numpy()
+        camera = Camera(
+            colmap_id=camera.colmap_id,
+            R=camera.R,
+            T=camera.T,
+            FoVx=camera.FoVx,
+            FoVy=camera.FoVy,
+            image=torch.ones_like(camera.original_image),
+            gt_alpha_mask=None,
+            image_name=None,
+            uid=camera.uid,
+            trans=camera_center_trans,
+            data_device=camera.data_device
+        )
+        return camera
+
+    def getInterpolatedCamera(self, camera, camera_src):
+        intrinsics, extrinsic = camera.get_calib_matrix_nerf()
+        intrinsics, extrinsic_src = camera_src.get_calib_matrix_nerf()
+        c2w = torch.inverse(extrinsic)
+        c2w_src = torch.inverse(extrinsic_src)
+        w = torch.rand(1).squeeze()
+        c2w_unseen = w * c2w + (1-w)*c2w_src
+        w2c_unseen = torch.inverse(c2w_unseen)
+        R = w2c_unseen[:3, :3].transpose(0, 1)
+        T = w2c_unseen[:3, 3]
+        camera = Camera(
+            colmap_id=camera.colmap_id,
+            R = R.cpu().numpy(),
+            T = T.cpu().numpy(),
+            FoVx = camera.FoVx,
+            FoVy = camera.FoVy,
+            image = torch.ones_like(camera.original_image),
+            gt_alpha_mask=None,
+            image_name=None,
+            uid=None,
+            data_device=camera.data_device
+        )
+        return camera
+
+
+class RenderScene:
+    gaussians: GaussianModel
+
+    def __init__(self, args: ModelParams, gaussians: GaussianModel, load_iteration=None, spiral=True, resolution_scales=[1.0]):
+        """b
+        :param path: Path to colmap scene main folder.
+        """
+        self.model_path = args.model_path
+        self.loaded_iter = None
+        self.gaussians = gaussians
+
+        if load_iteration:
+            if load_iteration == -1:
+                self.loaded_iter = searchForMaxIteration(os.path.join(self.model_path, "point_cloud"))
+            else:
+                self.loaded_iter = load_iteration
+            print("Loading trained model at iteration {}".format(self.loaded_iter))
+
+        self.test_cameras = {}
+
+        if 'scan' in args.source_path:
+            scene_info = sceneLoadTypeCallbacks["SpiralDTU"](args.source_path)
         else:
-            return self.pseudo_cameras[scale]        
+            scene_info = sceneLoadTypeCallbacks["Spiral"](args.source_path)
+
+        self.cameras_extent = scene_info.nerf_normalization["radius"]
+
+        for resolution_scale in resolution_scales:
+            print("Loading Render Cameras", resolution_scales)
+            self.test_cameras[resolution_scale] = renderCameraList_from_camInfos(scene_info.test_cameras,
+                                                                                 resolution_scale, args)
+
+        if self.loaded_iter:
+            self.gaussians.load_ply(os.path.join(self.model_path,
+                                                 "point_cloud",
+                                                 "iteration_" + str(self.loaded_iter),
+                                                 "point_cloud.ply"))
+        else:
+            pass
+
+    def getRenderCameras(self, scale=1.0):
+        return self.test_cameras[scale]
