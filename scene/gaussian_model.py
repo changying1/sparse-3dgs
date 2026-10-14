@@ -20,6 +20,7 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+from utils.i2_lifecycle import GaussianLifecycle
 
 class GaussianModel:
 
@@ -56,10 +57,20 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        # Kept as ``None`` on the default path: no lifecycle tensors are
+        # allocated unless tracking is explicitly enabled by train.py.
+        self.lifecycle = None
         self.setup_functions()
 
+    def enable_lifecycle_tracking(self):
+        if self.lifecycle is not None:
+            raise RuntimeError("Gaussian lifecycle tracking is already enabled")
+        self.lifecycle = GaussianLifecycle.roots(
+            self.get_xyz.shape[0], self.get_xyz.device
+        )
+
     def capture(self):
-        return (
+        base_state = (
             self.active_sh_degree,
             self._xyz,
             self._features_dc,
@@ -73,8 +84,35 @@ class GaussianModel:
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
         )
+        if self.lifecycle is None:
+            return base_state
+        lifecycle_state = self.lifecycle.state_dict(
+            expected_count=self.get_xyz.shape[0]
+        )
+        return base_state + ({"i2_lifecycle": lifecycle_state},)
     
     def restore(self, model_args, training_args):
+        if not isinstance(model_args, (tuple, list)):
+            raise ValueError("Gaussian checkpoint state must be a tuple or list")
+        if len(model_args) == 12:
+            if self.lifecycle is not None:
+                raise ValueError(
+                    "Lifecycle tracking cannot restore a legacy checkpoint without "
+                    "lifecycle metadata; disable tracking or start a new I2 run"
+                )
+            base_args = model_args
+            lifecycle_state = None
+        elif len(model_args) == 13:
+            extension = model_args[12]
+            if not isinstance(extension, dict) or "i2_lifecycle" not in extension:
+                raise ValueError("Malformed I2 lifecycle checkpoint extension")
+            base_args = model_args[:12]
+            lifecycle_state = extension["i2_lifecycle"]
+        else:
+            raise ValueError(
+                f"Unsupported Gaussian checkpoint tuple length: {len(model_args)}"
+            )
+
         (self.active_sh_degree, 
         self._xyz, 
         self._features_dc, 
@@ -86,11 +124,17 @@ class GaussianModel:
         xyz_gradient_accum, 
         denom,
         opt_dict, 
-        self.spatial_lr_scale) = model_args
+        self.spatial_lr_scale) = base_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
+        if self.lifecycle is not None:
+            self.lifecycle = GaussianLifecycle.from_state_dict(
+                lifecycle_state,
+                expected_count=self.get_xyz.shape[0],
+                device=self.get_xyz.device,
+            )
 
     @property
     def get_scaling(self):
@@ -288,7 +332,11 @@ class GaussianModel:
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
-    def prune_points(self, mask):
+    def prune_points(self, mask, lifecycle_reason=None, iteration=None):
+        if self.lifecycle is not None and (
+            lifecycle_reason is None or iteration is None
+        ):
+            raise ValueError("Tracked Gaussian pruning requires a reason and iteration")
         valid_points_mask = ~mask
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
@@ -303,6 +351,9 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        if self.lifecycle is not None:
+            self.lifecycle.prune(mask, lifecycle_reason, iteration)
+            self.lifecycle.validate_lightweight(expected_count=self.get_xyz.shape[0])
 
     def opacity_decay(self, factor=0.99):
         opacity = self.get_opacity * factor
@@ -350,7 +401,9 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, collect_diagnostics=False):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, collect_diagnostics=False, iteration=None):
+        if self.lifecycle is not None and iteration is None:
+            raise ValueError("Tracked split requires the current iteration")
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -375,11 +428,19 @@ class GaussianModel:
             split_parents_selected = split_children_created // N
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        if self.lifecycle is not None:
+            self.lifecycle.append_children(
+                selected_pts_mask, "split", iteration, repeats=N
+            )
 
         if collect_diagnostics:
             gaussians_before_split_parent_prune = self.get_xyz.shape[0]
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
-        self.prune_points(prune_filter)
+        self.prune_points(
+            prune_filter,
+            lifecycle_reason="split_replaced",
+            iteration=iteration,
+        )
 
         if collect_diagnostics:
             return {
@@ -388,7 +449,9 @@ class GaussianModel:
                 "split_parents_deleted": gaussians_before_split_parent_prune - self.get_xyz.shape[0],
             }
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent, collect_diagnostics=False):
+    def densify_and_clone(self, grads, grad_threshold, scene_extent, collect_diagnostics=False, iteration=None):
+        if self.lifecycle is not None and iteration is None:
+            raise ValueError("Tracked clone requires the current iteration")
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
@@ -405,19 +468,33 @@ class GaussianModel:
             clone_added = new_xyz.shape[0]
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+        if self.lifecycle is not None:
+            self.lifecycle.append_children(selected_pts_mask, "clone", iteration)
 
         if collect_diagnostics:
             return clone_added
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, collect_diagnostics=False):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, collect_diagnostics=False, iteration=None):
         if collect_diagnostics:
             gaussians_before = self.get_xyz.shape[0]
 
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-        clone_added = self.densify_and_clone(grads, max_grad, extent, collect_diagnostics=collect_diagnostics)
-        split_counts = self.densify_and_split(grads, max_grad, extent, collect_diagnostics=collect_diagnostics)
+        clone_added = self.densify_and_clone(
+            grads,
+            max_grad,
+            extent,
+            collect_diagnostics=collect_diagnostics,
+            iteration=iteration,
+        )
+        split_counts = self.densify_and_split(
+            grads,
+            max_grad,
+            extent,
+            collect_diagnostics=collect_diagnostics,
+            iteration=iteration,
+        )
 
         opacity_prune_mask = (self.get_opacity < min_opacity).squeeze()
         prune_mask = opacity_prune_mask
@@ -430,7 +507,11 @@ class GaussianModel:
             # Diagnostics are opt-in: this scalar transfer/synchronization never
             # occurs on the baseline path.
             opacity_prune_deleted = int(torch.count_nonzero(opacity_prune_mask).item())
-        self.prune_points(prune_mask)
+        self.prune_points(
+            prune_mask,
+            lifecycle_reason="training_prune",
+            iteration=iteration,
+        )
 
         if collect_diagnostics:
             gaussians_after = self.get_xyz.shape[0]

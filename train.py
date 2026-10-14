@@ -45,6 +45,7 @@ from utils.oe_training import (
     apply_oe_structural_training_loss,
     validate_oe_training_configuration,
 )
+from utils.i2_lifecycle import add_i2_lifecycle_arguments
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -65,6 +66,8 @@ def training(dataset, opt, pipe, args):
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
+    if getattr(args, "enable_i2_lifecycle_tracking", False):
+        gaussians.enable_lifecycle_tracking()
     gaussians.training_setup(opt)
     densification_event_logger = None
     if getattr(args, "densification_diagnostics", False):
@@ -312,7 +315,13 @@ def training(dataset, opt, pipe, args):
                         size_threshold = None
                     size_threshold = None
                     if densification_event_logger is None:
-                        gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+                        gaussians.densify_and_prune(
+                            opt.densify_grad_threshold,
+                            0.005,
+                            scene.cameras_extent,
+                            size_threshold,
+                            iteration=iteration,
+                        )
                     else:
                         event_counts = gaussians.densify_and_prune(
                             opt.densify_grad_threshold,
@@ -320,6 +329,7 @@ def training(dataset, opt, pipe, args):
                             scene.cameras_extent,
                             size_threshold,
                             collect_diagnostics=True,
+                            iteration=iteration,
                         )
                         densification_event_logger.record(iteration, event_counts, gaussians.optimizer)
                 
@@ -434,6 +444,7 @@ if __name__ == "__main__":
     parser.add_argument("--suffix", type=str, default=None)
     add_oe_structural_arguments(parser)
     add_densification_diagnostics_argument(parser)
+    add_i2_lifecycle_arguments(parser)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
