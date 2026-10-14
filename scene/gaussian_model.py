@@ -21,6 +21,7 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from utils.i2_lifecycle import GaussianLifecycle
+from utils.i2_observation import GaussianObservation
 
 class GaussianModel:
 
@@ -60,6 +61,7 @@ class GaussianModel:
         # Kept as ``None`` on the default path: no lifecycle tensors are
         # allocated unless tracking is explicitly enabled by train.py.
         self.lifecycle = None
+        self.observation = None
         self.setup_functions()
 
     def enable_lifecycle_tracking(self):
@@ -68,6 +70,31 @@ class GaussianModel:
         self.lifecycle = GaussianLifecycle.roots(
             self.get_xyz.shape[0], self.get_xyz.device
         )
+
+    def enable_observation_tracking(self, view_identifiers):
+        if self.lifecycle is None:
+            raise ValueError("I2 observation tracking requires lifecycle tracking")
+        if self.observation is not None:
+            raise RuntimeError("Gaussian observation tracking is already enabled")
+        self.observation = GaussianObservation.zeros(
+            self.get_xyz.shape[0], self.get_xyz.device, view_identifiers
+        )
+
+    def record_real_view_observation(
+        self, dropout_mask, screen_supported_mask, view_index, iteration
+    ):
+        if self.observation is None:
+            return
+        if self.lifecycle is None:
+            raise RuntimeError("Observation state exists without lifecycle state")
+        self.observation.record_real_view(
+            dropout_mask,
+            screen_supported_mask,
+            view_index,
+            iteration,
+            is_real_view=True,
+        )
+        self.observation.validate_lightweight(expected_count=self.get_xyz.shape[0])
 
     def capture(self):
         base_state = (
@@ -89,7 +116,12 @@ class GaussianModel:
         lifecycle_state = self.lifecycle.state_dict(
             expected_count=self.get_xyz.shape[0]
         )
-        return base_state + ({"i2_lifecycle": lifecycle_state},)
+        extension = {"i2_lifecycle": lifecycle_state}
+        if self.observation is not None:
+            extension["i2_observation"] = self.observation.state_dict(
+                lifecycle_uid=self.lifecycle.uid
+            )
+        return base_state + (extension,)
     
     def restore(self, model_args, training_args):
         if not isinstance(model_args, (tuple, list)):
@@ -102,12 +134,19 @@ class GaussianModel:
                 )
             base_args = model_args
             lifecycle_state = None
+            observation_state = None
         elif len(model_args) == 13:
             extension = model_args[12]
             if not isinstance(extension, dict) or "i2_lifecycle" not in extension:
                 raise ValueError("Malformed I2 lifecycle checkpoint extension")
             base_args = model_args[:12]
             lifecycle_state = extension["i2_lifecycle"]
+            observation_state = extension.get("i2_observation")
+            if self.observation is not None and observation_state is None:
+                raise ValueError(
+                    "Observation tracking cannot restore a checkpoint without "
+                    "i2_observation metadata"
+                )
         else:
             raise ValueError(
                 f"Unsupported Gaussian checkpoint tuple length: {len(model_args)}"
@@ -132,6 +171,14 @@ class GaussianModel:
         if self.lifecycle is not None:
             self.lifecycle = GaussianLifecycle.from_state_dict(
                 lifecycle_state,
+                expected_count=self.get_xyz.shape[0],
+                device=self.get_xyz.device,
+            )
+        if self.observation is not None:
+            self.observation = GaussianObservation.from_state_dict(
+                observation_state,
+                lifecycle_uid=self.lifecycle.uid,
+                expected_view_identifiers=self.observation.view_identifiers,
                 expected_count=self.get_xyz.shape[0],
                 device=self.get_xyz.device,
             )
@@ -337,6 +384,10 @@ class GaussianModel:
             lifecycle_reason is None or iteration is None
         ):
             raise ValueError("Tracked Gaussian pruning requires a reason and iteration")
+        if self.observation is not None:
+            if self.lifecycle is None:
+                raise RuntimeError("Observation state exists without lifecycle state")
+            self.observation.validate_lightweight(expected_count=self.get_xyz.shape[0])
         valid_points_mask = ~mask
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
@@ -351,9 +402,13 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        if self.observation is not None:
+            self.observation.prune(mask)
         if self.lifecycle is not None:
             self.lifecycle.prune(mask, lifecycle_reason, iteration)
             self.lifecycle.validate_lightweight(expected_count=self.get_xyz.shape[0])
+        if self.observation is not None:
+            self.observation.validate_lightweight(expected_count=self.get_xyz.shape[0])
 
     def opacity_decay(self, factor=0.99):
         opacity = self.get_opacity * factor
@@ -432,6 +487,9 @@ class GaussianModel:
             self.lifecycle.append_children(
                 selected_pts_mask, "split", iteration, repeats=N
             )
+        if self.observation is not None:
+            self.observation.append_zeros(new_opacity.shape[0])
+            self.observation.validate_lightweight(expected_count=self.get_xyz.shape[0])
 
         if collect_diagnostics:
             gaussians_before_split_parent_prune = self.get_xyz.shape[0]
@@ -470,6 +528,9 @@ class GaussianModel:
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
         if self.lifecycle is not None:
             self.lifecycle.append_children(selected_pts_mask, "clone", iteration)
+        if self.observation is not None:
+            self.observation.append_zeros(new_opacities.shape[0])
+            self.observation.validate_lightweight(expected_count=self.get_xyz.shape[0])
 
         if collect_diagnostics:
             return clone_added

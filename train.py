@@ -46,6 +46,11 @@ from utils.oe_training import (
     validate_oe_training_configuration,
 )
 from utils.i2_lifecycle import add_i2_lifecycle_arguments
+from utils.i2_observation import (
+    add_i2_observation_arguments,
+    build_real_view_camera_mapping,
+    validate_i2_observation_configuration,
+)
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -55,6 +60,10 @@ TENSORBOARD_FOUND = False
 
 def training(dataset, opt, pipe, args):
     first_iter = 0
+    validate_i2_observation_configuration(
+        getattr(args, "enable_i2_observation_tracking", False),
+        getattr(args, "enable_i2_lifecycle_tracking", False),
+    )
     # Fail invalid I1-labelled experiments before creating an output directory.
     configured_active_interval = validate_oe_training_configuration(
         args.enable_oe_structural_loss,
@@ -68,12 +77,18 @@ def training(dataset, opt, pipe, args):
     scene = Scene(dataset, gaussians)
     if getattr(args, "enable_i2_lifecycle_tracking", False):
         gaussians.enable_lifecycle_tracking()
+    observation_view_index = None
+    if getattr(args, "enable_i2_observation_tracking", False):
+        view_identifiers, observation_view_index = build_real_view_camera_mapping(
+            scene.getTrainCameras(), getattr(dataset, "view_manifest", "")
+        )
+        gaussians.enable_observation_tracking(view_identifiers)
     gaussians.training_setup(opt)
     densification_event_logger = None
     if getattr(args, "densification_diagnostics", False):
         densification_event_logger = DensificationEventLogger(scene.model_path)
     if args.start_checkpoint:
-        (model_params, first_iter) = torch.load(args.start_checkpoint)
+        (model_params, first_iter) = torch.load(args.start_checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
     if args.enable_oe_structural_loss:
         configured_active_interval = validate_oe_training_configuration(
@@ -178,6 +193,25 @@ def training(dataset, opt, pipe, args):
         depth = render_pkg["rendered_depth"]
         alpha = render_pkg["rendered_alpha"]
         dropout_mask = render_pkg["dropout_mask"]
+
+        if gaussians.observation is not None:
+            # This hook consumes only the first render of the sampled real training
+            # camera.  It deliberately precedes any shifted-camera render.
+            full_screen_supported_mask = map_dropout_visibility_to_full_mask(
+                dropout_mask,
+                visibility_filter,
+                viewspace_point_tensor,
+            )
+            view_index = observation_view_index.get(viewpoint_cam.uid)
+            if view_index is None:
+                raise ValueError("Sampled training camera is missing from B0 view mapping")
+            with torch.no_grad():
+                gaussians.record_real_view_observation(
+                    dropout_mask,
+                    full_screen_supported_mask,
+                    view_index,
+                    iteration,
+                )
 
         gt_image = viewpoint_cam.original_image.cuda()
         
@@ -445,6 +479,7 @@ if __name__ == "__main__":
     add_oe_structural_arguments(parser)
     add_densification_diagnostics_argument(parser)
     add_i2_lifecycle_arguments(parser)
+    add_i2_observation_arguments(parser)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
