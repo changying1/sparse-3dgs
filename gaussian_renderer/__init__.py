@@ -14,10 +14,12 @@ import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
+from utils.i2_randomness import aligned_uniform_prefix
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
            scaling_modifier = 1.0, override_color = None, dropout_factor=0.0, 
-           sigma_noise = 0.0, render_pts=False, render_pts_scale=0.1, train=True):
+           sigma_noise = 0.0, render_pts=False, render_pts_scale=0.1, train=True,
+           dropout_reference_count=None):
     """
     Render the scene. 
     
@@ -39,11 +41,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
     
     # init random dropout mask
     if dropout_factor > 0.0 and train:
-        dropout_mask = torch.rand(opacity.shape[0], device=opacity.device).cuda()
-        dropout_mask = dropout_mask < (1 - dropout_factor)
+        dropout_draws, reference_dropout_draws = aligned_uniform_prefix(
+            opacity.shape[0], dropout_reference_count, device=opacity.device
+        )
+        dropout_mask = dropout_draws < (1 - dropout_factor)
     else:
         dropout_mask = torch.rand(opacity.shape[0], device=opacity.device).cuda()
         dropout_mask = dropout_mask < 1.1
+        reference_dropout_draws = None
 
     # The installed FSGS rasterizer scales per-Gaussian gradients by confidence.
     # Unit confidence preserves the existing gradients and must match the exact
@@ -119,7 +124,15 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
     # 2. add noise to opacity during training
     if train and sigma_noise > 0.0:
         # sigma_noise = 0.8  # 0.8
-        epsilon_opacity = torch.randn_like(opacity, device=opacity.device) * sigma_noise
+        if dropout_reference_count is not None and reference_dropout_draws is not None:
+            reference_retained = reference_dropout_draws < (1 - dropout_factor)
+            reference_opacity = torch.empty(
+                (reference_retained.sum(),) + tuple(opacity.shape[1:]),
+                dtype=opacity.dtype, device=opacity.device,
+            )
+            epsilon_opacity = torch.randn_like(reference_opacity)[:opacity.shape[0]] * sigma_noise
+        else:
+            epsilon_opacity = torch.randn_like(opacity, device=opacity.device) * sigma_noise
         epsilon_opacity = torch.clamp(epsilon_opacity, min=-sigma_noise, max=sigma_noise)  # 根据实际训练经验设定合理范围
         opacity = torch.clamp(opacity * (1.0 + epsilon_opacity), min=0.0, max=1.0)
 

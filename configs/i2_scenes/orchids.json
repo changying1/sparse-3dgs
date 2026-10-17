@@ -1,0 +1,11 @@
+{
+  "schema_version": "i2-scene-config-v1",
+  "scene": "orchids",
+  "dataset_root": "D:\\dataset\\nerf_llff_data_colmap\\orchids",
+  "view_manifest": {"path": "D:\\3DGS\\Binocular3DGS + Dropout\\output\\Orchids_3v_FrozenPDC_v1\\view_manifest.json", "sha256": "8338e4024825438f27438e334d92d5c46b19fc9fb08efce8e167dbe338d5e1f4"},
+  "pdc": {"path": "D:\\3DGS\\Binocular3DGS + Dropout\\keypoints_to_3d\\LLFF_Orchids_3v_FrozenPDC_v1\\orchids_keypoints_to_3d.ply", "sha256": "3c92a3868516b4e9814eecddbb6fca61b95601188548827f7a2962b143917278"},
+  "depth_cache": {"path": "D:\\3DGS\\Binocular3DGS + Dropout\\output\\I1_Orchids_3v_MiDaS_DPT_Hybrid_Cache_v2", "metadata_sha256": "580ab5c36f71333ef319b062edd1d17a4fabec480bc3ba66362d4ffde166eafc"},
+  "split": {"train_images": ["IMG_4468.JPG", "IMG_4479.JPG", "IMG_4490.JPG"], "test_images": ["IMG_4467.JPG", "IMG_4475.JPG", "IMG_4483.JPG", "IMG_4491.JPG"]},
+  "common_source": {"checkpoint": null, "sha256": null},
+  "output_namespace": "i2_orchids"
+}

@@ -11,6 +11,8 @@
 
 import os
 import random
+import hashlib
+from pathlib import Path
 
 import torch
 from random import randint
@@ -51,6 +53,20 @@ from utils.i2_observation import (
     build_real_view_camera_mapping,
     validate_i2_observation_configuration,
 )
+from utils.i2_future_utility import (
+    add_i2_future_utility_arguments,
+    validate_i2_future_utility_configuration,
+)
+from utils.i2_active_pilot import (
+    add_i2_active_pilot_arguments,
+    apply_active_reallocation,
+    apply_birth_only,
+    apply_release_only,
+    load_active_plan,
+    record_release_only_reference_extension,
+    validate_i2_active_configuration,
+)
+from utils.i2_randomness import ReleaseOnlyDropoutReference
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -64,6 +80,28 @@ def training(dataset, opt, pipe, args):
         getattr(args, "enable_i2_observation_tracking", False),
         getattr(args, "enable_i2_lifecycle_tracking", False),
     )
+    validate_i2_future_utility_configuration(
+        getattr(args, "enable_i2_future_utility_tracking", False),
+        getattr(args, "enable_i2_lifecycle_tracking", False),
+        getattr(args, "enable_i2_observation_tracking", False),
+    )
+    validate_i2_active_configuration(
+        getattr(args, "enable_i2_active_pilot", False),
+        getattr(args, "i2_active_plan", ""),
+        getattr(args, "i2_active_event_log", ""),
+        getattr(args, "i2_active_budget", 20),
+        release_only=getattr(args, "enable_i2_release_only", False),
+        birth_only=getattr(args, "enable_i2_birth_only", False),
+    )
+    if (
+        getattr(args, "enable_i2_active_pilot", False)
+        or getattr(args, "enable_i2_release_only", False)
+        or getattr(args, "enable_i2_birth_only", False)
+    ):
+        if not args.start_checkpoint:
+            raise ValueError("Active pilot requires --start_checkpoint")
+        if not (args.enable_i2_lifecycle_tracking and args.enable_i2_observation_tracking):
+            raise ValueError("Active pilot requires A0 lifecycle and B0 observation tracking")
     # Fail invalid I1-labelled experiments before creating an output directory.
     configured_active_interval = validate_oe_training_configuration(
         args.enable_oe_structural_loss,
@@ -83,6 +121,8 @@ def training(dataset, opt, pipe, args):
             scene.getTrainCameras(), getattr(dataset, "view_manifest", "")
         )
         gaussians.enable_observation_tracking(view_identifiers)
+    if getattr(args, "enable_i2_future_utility_tracking", False):
+        gaussians.enable_future_utility_tracking()
     gaussians.training_setup(opt)
     densification_event_logger = None
     if getattr(args, "densification_diagnostics", False):
@@ -90,6 +130,43 @@ def training(dataset, opt, pipe, args):
     if args.start_checkpoint:
         (model_params, first_iter) = torch.load(args.start_checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
+    dropout_reference = None
+    if (
+        getattr(args, "enable_i2_active_pilot", False)
+        or getattr(args, "enable_i2_release_only", False)
+        or getattr(args, "enable_i2_birth_only", False)
+    ):
+        active_plan = load_active_plan(
+            args.i2_active_plan,
+            requested_budget=args.i2_active_budget,
+            source_checkpoint=args.start_checkpoint,
+        )
+        if getattr(args, "i2_adaptive_decision", ""):
+            decision_path = Path(args.i2_adaptive_decision).resolve()
+            if not decision_path.is_file():
+                raise ValueError("Adaptive Decision does not exist")
+            active_plan["_adaptive_decision_path"] = str(decision_path)
+            active_plan["_adaptive_decision_sha256"] = hashlib.sha256(
+                decision_path.read_bytes()
+            ).hexdigest()
+        if getattr(args, "enable_i2_release_only", False):
+            release_event = apply_release_only(
+                gaussians, active_plan, iteration=int(first_iter),
+                event_log=args.i2_active_event_log,
+            )
+            dropout_reference = ReleaseOnlyDropoutReference(
+                int(release_event["gaussian_before"])
+            )
+        elif getattr(args, "enable_i2_birth_only", False):
+            apply_birth_only(
+                gaussians, active_plan, iteration=int(first_iter),
+                event_log=args.i2_active_event_log,
+            )
+        else:
+            apply_active_reallocation(
+                gaussians, active_plan, iteration=int(first_iter),
+                event_log=args.i2_active_event_log,
+            )
     if args.enable_oe_structural_loss:
         configured_active_interval = validate_oe_training_configuration(
             True,
@@ -182,9 +259,36 @@ def training(dataset, opt, pipe, args):
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
+        effective_dropout_reference_count = None
+        if dropout_reference is not None:
+            extension_was_unrecorded = (
+                dropout_reference.first_extension_iteration is None
+            )
+            current_gaussian_count = int(gaussians.get_xyz.shape[0])
+            effective_dropout_reference_count = dropout_reference.resolve(
+                current_gaussian_count, iteration
+            )
+            if (
+                extension_was_unrecorded
+                and dropout_reference.first_extension_iteration is not None
+            ):
+                record_release_only_reference_extension(
+                    args.i2_active_event_log,
+                    iteration=iteration,
+                    gaussian_count=current_gaussian_count,
+                    effective_reference_count=effective_dropout_reference_count,
+                )
+                print(
+                    "\n[I2 RNG] Release-only Dropout reference extended at "
+                    f"iteration {iteration}: {dropout_reference.initial_count} -> "
+                    f"{effective_dropout_reference_count} Gaussians. Strict cross-arm "
+                    "RNG-stream alignment no longer applies."
+                )
+
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, 
                             dropout_factor=args.dropout_factor, 
-                            sigma_noise=args.sigma_noise, train=True)
+                            sigma_noise=args.sigma_noise, train=True,
+                            dropout_reference_count=effective_dropout_reference_count)
         
         image = render_pkg["render"]
         viewspace_point_tensor = render_pkg["viewspace_points"]
@@ -480,6 +584,8 @@ if __name__ == "__main__":
     add_densification_diagnostics_argument(parser)
     add_i2_lifecycle_arguments(parser)
     add_i2_observation_arguments(parser)
+    add_i2_future_utility_arguments(parser)
+    add_i2_active_pilot_arguments(parser)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 

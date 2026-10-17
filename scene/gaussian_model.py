@@ -22,6 +22,7 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from utils.i2_lifecycle import GaussianLifecycle
 from utils.i2_observation import GaussianObservation
+from utils.i2_future_utility import GaussianFutureUtility
 
 class GaussianModel:
 
@@ -62,6 +63,7 @@ class GaussianModel:
         # allocated unless tracking is explicitly enabled by train.py.
         self.lifecycle = None
         self.observation = None
+        self.future_utility = None
         self.setup_functions()
 
     def enable_lifecycle_tracking(self):
@@ -80,6 +82,15 @@ class GaussianModel:
             self.get_xyz.shape[0], self.get_xyz.device, view_identifiers
         )
 
+    def enable_future_utility_tracking(self):
+        if self.lifecycle is None or self.observation is None:
+            raise ValueError("I2 future-utility tracking requires A0+B0 tracking")
+        if self.future_utility is not None:
+            raise RuntimeError("Gaussian future-utility tracking is already enabled")
+        self.future_utility = GaussianFutureUtility.empty(
+            self.get_xyz.shape[0], self.get_xyz.device
+        )
+
     def record_real_view_observation(
         self, dropout_mask, screen_supported_mask, view_index, iteration
     ):
@@ -95,6 +106,15 @@ class GaussianModel:
             is_real_view=True,
         )
         self.observation.validate_lightweight(expected_count=self.get_xyz.shape[0])
+        if self.future_utility is not None:
+            self.future_utility.capture_due(
+                lifecycle=self.lifecycle,
+                observation=self.observation,
+                xyz=self.get_xyz,
+                opacity=self.get_opacity,
+                scaling=self.get_scaling,
+                iteration=iteration,
+            )
 
     def capture(self):
         base_state = (
@@ -121,6 +141,10 @@ class GaussianModel:
             extension["i2_observation"] = self.observation.state_dict(
                 lifecycle_uid=self.lifecycle.uid
             )
+        if self.future_utility is not None:
+            extension["i2_future_utility"] = self.future_utility.state_dict(
+                lifecycle_uid=self.lifecycle.uid
+            )
         return base_state + (extension,)
     
     def restore(self, model_args, training_args):
@@ -135,6 +159,7 @@ class GaussianModel:
             base_args = model_args
             lifecycle_state = None
             observation_state = None
+            future_utility_state = None
         elif len(model_args) == 13:
             extension = model_args[12]
             if not isinstance(extension, dict) or "i2_lifecycle" not in extension:
@@ -142,6 +167,7 @@ class GaussianModel:
             base_args = model_args[:12]
             lifecycle_state = extension["i2_lifecycle"]
             observation_state = extension.get("i2_observation")
+            future_utility_state = extension.get("i2_future_utility")
             if self.observation is not None and observation_state is None:
                 raise ValueError(
                     "Observation tracking cannot restore a checkpoint without "
@@ -182,6 +208,20 @@ class GaussianModel:
                 expected_count=self.get_xyz.shape[0],
                 device=self.get_xyz.device,
             )
+        if self.future_utility is not None:
+            # An A0+B0 checkpoint may bootstrap C prospectively.  Existing
+            # Gaussians are not backfilled: only children born after resume get
+            # C records, which avoids inventing unavailable birth evidence.
+            if future_utility_state is None:
+                self.future_utility = GaussianFutureUtility.empty(
+                    self.get_xyz.shape[0], self.get_xyz.device
+                )
+            else:
+                self.future_utility = GaussianFutureUtility.from_state_dict(
+                    future_utility_state,
+                    lifecycle_uid=self.lifecycle.uid,
+                    device=self.get_xyz.device,
+                )
 
     @property
     def get_scaling(self):
@@ -388,6 +428,19 @@ class GaussianModel:
             if self.lifecycle is None:
                 raise RuntimeError("Observation state exists without lifecycle state")
             self.observation.validate_lightweight(expected_count=self.get_xyz.shape[0])
+        if self.future_utility is not None:
+            if self.observation is None or self.lifecycle is None:
+                raise RuntimeError("Future-utility state exists without A0+B0 state")
+            self.future_utility.record_deaths(
+                mask=mask,
+                lifecycle=self.lifecycle,
+                observation=self.observation,
+                xyz=self.get_xyz,
+                opacity=self.get_opacity,
+                scaling=self.get_scaling,
+                iteration=iteration,
+                reason=lifecycle_reason,
+            )
         valid_points_mask = ~mask
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
@@ -404,6 +457,8 @@ class GaussianModel:
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         if self.observation is not None:
             self.observation.prune(mask)
+        if self.future_utility is not None:
+            self.future_utility.prune(mask)
         if self.lifecycle is not None:
             self.lifecycle.prune(mask, lifecycle_reason, iteration)
             self.lifecycle.validate_lightweight(expected_count=self.get_xyz.shape[0])
@@ -436,7 +491,12 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation,
+                              preserve_existing_stats=False):
+        old_count = int(self.get_xyz.shape[0])
+        old_xyz_gradient_accum = self.xyz_gradient_accum
+        old_denom = self.denom
+        old_max_radii2D = self.max_radii2D
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -452,9 +512,24 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        added = int(self.get_xyz.shape[0]) - old_count
+        device = self.get_xyz.device
+        if preserve_existing_stats:
+            self.xyz_gradient_accum = torch.cat((
+                old_xyz_gradient_accum,
+                torch.zeros((added, 1), dtype=old_xyz_gradient_accum.dtype, device=device),
+            ))
+            self.denom = torch.cat((
+                old_denom, torch.zeros((added, 1), dtype=old_denom.dtype, device=device),
+            ))
+            self.max_radii2D = torch.cat((
+                old_max_radii2D,
+                torch.zeros((added,), dtype=old_max_radii2D.dtype, device=device),
+            ))
+        else:
+            self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=device)
+            self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=device)
+            self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device=device)
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, collect_diagnostics=False, iteration=None):
         if self.lifecycle is not None and iteration is None:
@@ -484,12 +559,27 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
         if self.lifecycle is not None:
-            self.lifecycle.append_children(
+            previous_count = self.lifecycle.uid.numel()
+            child_uid = self.lifecycle.append_children(
                 selected_pts_mask, "split", iteration, repeats=N
             )
         if self.observation is not None:
             self.observation.append_zeros(new_opacity.shape[0])
             self.observation.validate_lightweight(expected_count=self.get_xyz.shape[0])
+        if self.future_utility is not None:
+            child_count = child_uid.numel()
+            tail = slice(self.get_xyz.shape[0] - child_count, self.get_xyz.shape[0])
+            self.future_utility.append_births(
+                child_uid=child_uid,
+                birth_iter=self.lifecycle.birth_iter[tail],
+                birth_type=self.lifecycle.birth_type[tail],
+                source_uid=self.lifecycle.source_uid[tail],
+                generation=self.lifecycle.generation[tail],
+                xyz=self.get_xyz[tail],
+                opacity=self.get_opacity[tail],
+                scaling=self.get_scaling[tail],
+                previous_count=previous_count,
+            )
 
         if collect_diagnostics:
             gaussians_before_split_parent_prune = self.get_xyz.shape[0]
@@ -527,10 +617,25 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
         if self.lifecycle is not None:
-            self.lifecycle.append_children(selected_pts_mask, "clone", iteration)
+            previous_count = self.lifecycle.uid.numel()
+            child_uid = self.lifecycle.append_children(selected_pts_mask, "clone", iteration)
         if self.observation is not None:
             self.observation.append_zeros(new_opacities.shape[0])
             self.observation.validate_lightweight(expected_count=self.get_xyz.shape[0])
+        if self.future_utility is not None:
+            child_count = child_uid.numel()
+            tail = slice(self.get_xyz.shape[0] - child_count, self.get_xyz.shape[0])
+            self.future_utility.append_births(
+                child_uid=child_uid,
+                birth_iter=self.lifecycle.birth_iter[tail],
+                birth_type=self.lifecycle.birth_type[tail],
+                source_uid=self.lifecycle.source_uid[tail],
+                generation=self.lifecycle.generation[tail],
+                xyz=self.get_xyz[tail],
+                opacity=self.get_opacity[tail],
+                scaling=self.get_scaling[tail],
+                previous_count=previous_count,
+            )
 
         if collect_diagnostics:
             return clone_added

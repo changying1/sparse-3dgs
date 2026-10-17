@@ -1,0 +1,89 @@
+{
+  "schema_version": "i2-method-config-v1",
+  "method_id": "observation_evidence_guided_resource_reallocation_receiver_v2",
+  "budget": {
+    "requested_k": 20
+  },
+  "source": {
+    "iteration": 1201,
+    "enable_i1_structural_loss": true,
+    "i1_weight": 0.1,
+    "i1_start_iteration": 1,
+    "i1_end_iteration": 1201,
+    "stable_quantile": 0.8,
+    "structure_gate_mode": "stable_evidence",
+    "preserve_baseline_densification_stats": true,
+    "enable_a0": true,
+    "enable_b0": true,
+    "enable_c": false
+  },
+  "donor": {
+    "b1_low_quantile": 0.25,
+    "minimum_age": 100,
+    "minimum_real_view_opportunities": 1,
+    "max_single_or_joint_mean_abs_rgb_delta": 0.0001,
+    "max_single_or_joint_psnr_drop_db": 0.01
+  },
+  "receiver_candidates": {
+    "block_size": 12,
+    "per_view_limit": 250,
+    "max_candidates": 200,
+    "minimum_alpha": 0.5,
+    "max_reprojection_error_px": 0.001,
+    "spatial_nms_fraction": 0.001,
+    "density_radius_fraction": 0.005
+  },
+  "receiver_v2": {
+    "method_version": "receiver_v2_tangent_jacobian_v1",
+    "max_projection_condition": 25.0,
+    "max_displacement_tangent_norm_factor": 2.0,
+    "minimum_displacement_min_tangent_scale_factor": 0.1,
+    "minimum_projected_residual_reduction_fraction": 0.25,
+    "activated_opacity": 0.05,
+    "footprint_pixels": 2.0,
+    "tangent_scale_lower_factor": 0.2,
+    "tangent_scale_upper_factor": 0.6,
+    "normal_scale_factor": 0.35,
+    "positive_depth_all_training_views": true,
+    "occlusion_veto_enabled": true,
+    "fail_closed": true
+  },
+  "initialization_audit": {
+    "max_target_l1_increase": 0.0,
+    "max_outside_l1_increase": 0.00005,
+    "max_global_l1_increase": 0.00005
+  },
+  "training": {
+    "dataset_name": "LLFF",
+    "n_views": 3,
+    "resolution": 8,
+    "sh_degree": 1,
+    "dropout_factor": 0.2,
+    "sigma_noise": 0.0,
+    "densify_from_iteration": 1000,
+    "densification_interval": 100,
+    "densify_grad_threshold": 0.0002,
+    "final_iteration": 5000,
+    "test_iterations": [1500, 2000, 3000, 4000, 5000],
+    "checkpoint_iterations": [2000, 3500, 5000],
+    "save_iterations": [5000],
+    "random_seed": 0,
+    "i1_after_source": false,
+    "future_utility_c": false
+  },
+  "smoke": {
+    "final_iteration": 1252,
+    "test_iterations": [1252],
+    "checkpoint_iterations": [1252],
+    "save_iterations": [1252]
+  },
+  "evaluation": {
+    "protocol": "in_memory_full_float_v1",
+    "metrics": ["PSNR", "SSIM", "LPIPS", "L1"],
+    "use_test_views_only_after_method_freeze": true
+  },
+  "runtime": {
+    "python": "D:\\Users\\huashuo\\anaconda3\\envs\\fsgs\\python.exe"
+  },
+  "randomness_caveat": "Equal seeds do not guarantee strictly paired RNG streams after scene-dependent densification changes Gaussian counts or draw counts."
+}

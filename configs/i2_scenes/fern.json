@@ -1,0 +1,26 @@
+{
+  "schema_version": "i2-scene-config-v1",
+  "scene": "fern",
+  "dataset_root": "D:\\dataset\\nerf_llff_data_colmap\\fern",
+  "view_manifest": {
+    "path": "D:\\3DGS\\Binocular3DGS + Dropout\\output\\A3_A3_Fern_3v_Baseline_5k_FrozenPDC\\view_manifest.json",
+    "sha256": "dfe1c8a769b4e3cea96c585014119c05757fe513fe9d24485f2f99e3cf15aa24"
+  },
+  "pdc": {
+    "path": "D:\\3DGS\\Binocular3DGS + Dropout\\keypoints_to_3d\\LLFF_Fern_3v_FrozenPDC_v2\\fern_keypoints_to_3d.ply",
+    "sha256": "bf423f3c4cd0dd8db68a5f7593982c9a287c4ee0b26f30b540d883686d411f8d"
+  },
+  "depth_cache": {
+    "path": "D:\\3DGS\\Binocular3DGS + Dropout\\output\\I1_Fern_3v_MiDaS_DPT_Hybrid_Cache_v2",
+    "metadata_sha256": "5a34b188b81ec116fff3200e3dcb362573b557eb2537b4f3794264a2a0d9d991"
+  },
+  "split": {
+    "train_images": ["IMG_4027.JPG", "IMG_4036.JPG", "IMG_4045.JPG"],
+    "test_images": ["IMG_4026.JPG", "IMG_4034.JPG", "IMG_4042.JPG"]
+  },
+  "common_source": {
+    "checkpoint": "output/I2_Fern_CommonSource_I1_A0B0_1201/chkpnt1201.pth",
+    "sha256": "46786328d0504053689668d0d5ca19be29a3a0c1a191ce3d266ac00d21fa8315"
+  },
+  "output_namespace": "i2_fern"
+}

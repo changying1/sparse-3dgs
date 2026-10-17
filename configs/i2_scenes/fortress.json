@@ -1,0 +1,11 @@
+{
+  "schema_version": "i2-scene-config-v1",
+  "scene": "fortress",
+  "dataset_root": "D:\\dataset\\nerf_llff_data_colmap\\fortress",
+  "view_manifest": {"path": "D:\\3DGS\\Binocular3DGS + Dropout\\output\\Fortress_3v_FrozenPDC_v1\\view_manifest.json", "sha256": "8d30c970680d26c94276b4aff04fcd2b8c1020fd3df4d51c44e454144f7402d2"},
+  "pdc": {"path": "D:\\3DGS\\Binocular3DGS + Dropout\\keypoints_to_3d\\LLFF_Fortress_3v_FrozenPDC_v1\\fortress_keypoints_to_3d.ply", "sha256": "1b0d97e68e6065411314c9cddd3fca263ba76122a9ab37546ee44548d1e17944"},
+  "depth_cache": {"path": "D:\\3DGS\\Binocular3DGS + Dropout\\output\\I1_Fortress_3v_MiDaS_DPT_Hybrid_Cache_v2", "metadata_sha256": "1aff05afd0975597c2df85ae175ba940c5ce8ff97a952c8bed6a860373940fdd"},
+  "split": {"train_images": ["IMG_1801.JPG", "IMG_1821.JPG", "IMG_1841.JPG"], "test_images": ["IMG_1800.JPG", "IMG_1808.JPG", "IMG_1816.JPG", "IMG_1824.JPG", "IMG_1832.JPG", "IMG_1840.JPG"]},
+  "common_source": {"checkpoint": null, "sha256": null},
+  "output_namespace": "i2_fortress"
+}

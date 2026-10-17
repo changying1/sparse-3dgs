@@ -1,0 +1,11 @@
+{
+  "schema_version": "i2-scene-config-v1",
+  "scene": "flower",
+  "dataset_root": "D:\\dataset\\nerf_llff_data_colmap\\flower",
+  "view_manifest": {"path": "D:\\3DGS\\Binocular3DGS + Dropout\\output\\Flower_3v_FrozenPDC_v1\\view_manifest.json", "sha256": "fdabbc6dcf4cc49e32fb4c055a0a2f0ef7c7455c9610814edf9232dcad792b6e"},
+  "pdc": {"path": "D:\\3DGS\\Binocular3DGS + Dropout\\keypoints_to_3d\\LLFF_Flower_3v_FrozenPDC_v1\\flower_keypoints_to_3d.ply", "sha256": "0bad102dd2a8af06465927da9a0dec61654f3d55498286acd76497837762b751"},
+  "depth_cache": {"path": "D:\\3DGS\\Binocular3DGS + Dropout\\output\\I1_Flower_3v_MiDaS_DPT_Hybrid_Cache_v2", "metadata_sha256": "3bc9a8fbfae94e5f02d07618da9194ebfd5589c6e97998a6a89230e3171d82cd"},
+  "split": {"train_images": ["IMG_2963.JPG", "IMG_2979.JPG", "IMG_2995.JPG"], "test_images": ["IMG_2962.JPG", "IMG_2970.JPG", "IMG_2978.JPG", "IMG_2986.JPG", "IMG_2994.JPG"]},
+  "common_source": {"checkpoint": null, "sha256": null},
+  "output_namespace": "i2_flower"
+}

@@ -1,0 +1,31 @@
+{
+  "schema_version": "i2-adaptive-k-policy-v1",
+  "policy_id": "i2_adaptive_k_r0",
+  "version": "R0-v1",
+  "candidate_budget_cap": 20,
+  "receiver": {
+    "geometry": "receiver_v2_tangent_jacobian_v1",
+    "ranking": "photometric_alignment_desc_demand_score_desc_candidate_id_asc",
+    "nms": "greedy_spatial_nms_v1",
+    "positive_evidence": "photometric_alignment_gt_zero",
+    "require_finite_alignment": true,
+    "require_positive_set_equals_prefix": true,
+    "audit_all_candidates": true
+  },
+  "donor": {
+    "ranking": "frozen_d0_order",
+    "require_individual_safety": true,
+    "require_contiguous_joint_prefix": true
+  },
+  "initialization": {
+    "audit_prefixes_from_k": 1,
+    "stop_after_first_failure": true,
+    "require_contiguous_safe_prefix": true
+  },
+  "forbidden_budget_signals": [
+    "PSNR",
+    "SSIM",
+    "LPIPS",
+    "test_images"
+  ]
+}

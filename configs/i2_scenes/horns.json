@@ -1,0 +1,26 @@
+{
+  "schema_version": "i2-scene-config-v1",
+  "scene": "horns",
+  "dataset_root": "D:\\dataset\\nerf_llff_data_colmap\\horns",
+  "view_manifest": {
+    "path": "D:\\3DGS\\Binocular3DGS + Dropout\\output\\A3_A3_Horns_3v_Baseline_5k_FrozenPDC\\view_manifest.json",
+    "sha256": "a43d544c48f4767369ab37cf9ff82106f1d64365cb0e03d129559d297108586b"
+  },
+  "pdc": {
+    "path": "D:\\3DGS\\Binocular3DGS + Dropout\\keypoints_to_3d\\LLFF_A3_A3_Horns_3v_Baseline_5k_FrozenPDC\\horns_keypoints_to_3d.ply",
+    "sha256": "971e1836b1fe88cba1a34d9f42c553ad75e2444e9313a75611b7cd6d4d023c7d"
+  },
+  "depth_cache": {
+    "path": "D:\\3DGS\\Binocular3DGS + Dropout\\output\\I1_Horns_3v_MiDaS_DPT_Hybrid_Cache_v2",
+    "metadata_sha256": "c9828316d252c4e17ad7e09386453e04986caca6325794df998518819944ddfc"
+  },
+  "split": {
+    "train_images": ["DJI_20200223_163017_967.jpg", "DJI_20200223_163053_863.jpg", "DJI_20200223_163225_243.jpg"],
+    "test_images": ["DJI_20200223_163016_842.jpg", "DJI_20200223_163024_597.jpg", "DJI_20200223_163033_432.jpg", "DJI_20200223_163047_307.jpg", "DJI_20200223_163055_437.jpg", "DJI_20200223_163103_777.jpg", "DJI_20200223_163201_633.jpg", "DJI_20200223_163208_938.jpg"]
+  },
+  "common_source": {
+    "checkpoint": "output/I2_B0_Horns_3v_1201_Growth_z98bpswi/chkpnt1201.pth",
+    "sha256": "1d5ee65d9bb1f7b50b2d8ea6bd277e5b52e513b212d0216e3a205e014b428c1f"
+  },
+  "output_namespace": "i2_horns"
+}

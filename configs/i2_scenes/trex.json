@@ -1,0 +1,11 @@
+{
+  "schema_version": "i2-scene-config-v1",
+  "scene": "trex",
+  "dataset_root": "D:\\dataset\\nerf_llff_data_colmap\\trex",
+  "view_manifest": {"path": "D:\\3DGS\\Binocular3DGS + Dropout\\output\\T-Rex_3v_FrozenPDC_v1\\view_manifest.json", "sha256": "ae86e0ee71805cf04ac6b7bcea0bb0302aa1d08f41ddbe057308eabb2a6cf881"},
+  "pdc": {"path": "D:\\3DGS\\Binocular3DGS + Dropout\\keypoints_to_3d\\LLFF_T-Rex_3v_FrozenPDC_v1\\trex_keypoints_to_3d.ply", "sha256": "14da7f12510582dabb347228a1bbc800a3e563566de6cfd55448fd93e5d34844"},
+  "depth_cache": {"path": "D:\\3DGS\\Binocular3DGS + Dropout\\output\\I1_T-Rex_3v_MiDaS_DPT_Hybrid_Cache_v2", "metadata_sha256": "9090c99a6c08dbb205664b2a1a488c8b03f7339fedfd7d66a67f591a6caac27a"},
+  "split": {"train_images": ["DJI_20200223_163551_210.jpg", "DJI_20200223_163616_980.jpg", "DJI_20200223_163654_571.jpg"], "test_images": ["DJI_20200223_163548_810.jpg", "DJI_20200223_163557_660.jpg", "DJI_20200223_163604_605.jpg", "DJI_20200223_163611_160.jpg", "DJI_20200223_163620_700.jpg", "DJI_20200223_163639_916.jpg", "DJI_20200223_163646_755.jpg"]},
+  "common_source": {"checkpoint": null, "sha256": null},
+  "output_namespace": "i2_trex"
+}

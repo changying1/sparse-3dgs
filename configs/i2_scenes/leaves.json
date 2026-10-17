@@ -1,0 +1,11 @@
+{
+  "schema_version": "i2-scene-config-v1",
+  "scene": "leaves",
+  "dataset_root": "D:\\dataset\\nerf_llff_data_colmap\\leaves",
+  "view_manifest": {"path": "D:\\3DGS\\Binocular3DGS + Dropout\\output\\Leaves_3v_FrozenPDC_v1\\view_manifest.json", "sha256": "e32abc9067a4d9c5fa067d8fd846e9c929dc3f6bb278e0707ff3bbefd153e2e5"},
+  "pdc": {"path": "D:\\3DGS\\Binocular3DGS + Dropout\\keypoints_to_3d\\LLFF_Leaves_3v_FrozenPDC_v1\\leaves_keypoints_to_3d.ply", "sha256": "c6886229ed967fc1f73444d6d351f812ba090223d0c4b8c7bab6e67623022b25"},
+  "depth_cache": {"path": "D:\\3DGS\\Binocular3DGS + Dropout\\output\\I1_Leaves_3v_MiDaS_DPT_Hybrid_Cache_v2", "metadata_sha256": "27c792096e8950cea700c40aecb5604b373cb33e5f9a8aca9b87f2f5baa5d1b8"},
+  "split": {"train_images": ["IMG_2998.JPG", "IMG_3010.JPG", "IMG_3023.JPG"], "test_images": ["IMG_2997.JPG", "IMG_3006.JPG", "IMG_3014.JPG", "IMG_3022.JPG"]},
+  "common_source": {"checkpoint": null, "sha256": null},
+  "output_namespace": "i2_leaves"
+}

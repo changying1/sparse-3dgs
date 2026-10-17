@@ -18,7 +18,7 @@ LIFECYCLE_CHECKPOINT_VERSION = 1
 
 BIRTH_TYPE_TO_CODE = {"root": 0, "clone": 1, "split": 2}
 CODE_TO_BIRTH_TYPE = {value: key for key, value in BIRTH_TYPE_TO_CODE.items()}
-DEATH_REASONS = {"split_replaced", "training_prune"}
+DEATH_REASONS = {"split_replaced", "training_prune", "i2_active_release"}
 
 
 def add_i2_lifecycle_arguments(parser) -> None:
@@ -108,6 +108,49 @@ class GaussianLifecycle:
                 ),
             )
         )
+        self.source_uid = torch.cat((self.source_uid, parent_uid))
+        self.generation = torch.cat((self.generation, parent_generation + 1))
+        self._record_birth(iteration, birth_type, child_uid, parent_uid)
+        self.validate_lightweight()
+        return child_uid
+
+    def append_children_from_rows(
+        self, parent_rows: torch.Tensor, birth_type: str, iteration: int
+    ) -> torch.Tensor:
+        """Append intervention children from explicit rows, allowing repeats.
+
+        Native clone/split continues to use :meth:`append_children`; this
+        separate entry point makes the active path auditable without changing
+        frozen densification decisions.
+        """
+        self.validate_lightweight()
+        if birth_type not in ("clone", "split"):
+            raise ValueError("Children must have birth_type 'clone' or 'split'")
+        if not isinstance(iteration, int) or iteration < 0:
+            raise ValueError("Lifecycle iteration must be a non-negative integer")
+        if not torch.is_tensor(parent_rows) or parent_rows.dtype != torch.int64 or parent_rows.ndim != 1:
+            raise ValueError("parent_rows must be a one-dimensional int64 tensor")
+        parent_rows = parent_rows.to(device=self.uid.device)
+        if parent_rows.numel() and bool(
+            torch.any((parent_rows < 0) | (parent_rows >= self.uid.numel())).item()
+        ):
+            raise ValueError("parent_rows contains an out-of-range row")
+        parent_uid = self.uid[parent_rows]
+        parent_generation = self.generation[parent_rows]
+        child_count = int(parent_rows.numel())
+        child_uid = torch.arange(
+            self.next_uid, self.next_uid + child_count,
+            dtype=torch.int64, device=self.uid.device,
+        )
+        self.next_uid += child_count
+        self.uid = torch.cat((self.uid, child_uid))
+        self.birth_iter = torch.cat((self.birth_iter, torch.full(
+            (child_count,), iteration, dtype=torch.int64, device=self.uid.device
+        )))
+        self.birth_type = torch.cat((self.birth_type, torch.full(
+            (child_count,), BIRTH_TYPE_TO_CODE[birth_type],
+            dtype=torch.uint8, device=self.uid.device
+        )))
         self.source_uid = torch.cat((self.source_uid, parent_uid))
         self.generation = torch.cat((self.generation, parent_generation + 1))
         self._record_birth(iteration, birth_type, child_uid, parent_uid)

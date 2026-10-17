@@ -1,0 +1,11 @@
+{
+  "schema_version": "i2-scene-config-v1",
+  "scene": "room",
+  "dataset_root": "D:\\dataset\\nerf_llff_data_colmap\\room",
+  "view_manifest": {"path": "D:\\3DGS\\Binocular3DGS + Dropout\\output\\Room_3v_FrozenPDC_v1\\view_manifest.json", "sha256": "1f102eeed48762164e3c708acc48dfea6fefdd32ec19da2848e8b2d919c4e4dd"},
+  "pdc": {"path": "D:\\3DGS\\Binocular3DGS + Dropout\\keypoints_to_3d\\LLFF_Room_3v_FrozenPDC_v1\\room_keypoints_to_3d.ply", "sha256": "172d524b56b3749fc3e64985dcd058ac64630d94c8fa349240c78842e9e1938b"},
+  "depth_cache": {"path": "D:\\3DGS\\Binocular3DGS + Dropout\\output\\I1_Room_3v_MiDaS_DPT_Hybrid_Cache_v2", "metadata_sha256": "3c44216b6e861659fd19dff7cf82447b06c7206473fd623efad1d4b14a045453"},
+  "split": {"train_images": ["DJI_20200226_143851_396.JPG", "DJI_20200226_143918_576.JPG", "DJI_20200226_143946_704.JPG"], "test_images": ["DJI_20200226_143850_006.JPG", "DJI_20200226_143901_419.JPG", "DJI_20200226_143912_008.JPG", "DJI_20200226_143926_241.JPG", "DJI_20200226_143938_168.JPG", "DJI_20200226_143948_113.JPG"]},
+  "common_source": {"checkpoint": null, "sha256": null},
+  "output_namespace": "i2_room"
+}
